@@ -1,0 +1,752 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Iterable
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from openai import OpenAI
+
+
+@dataclass
+class BusinessLite:
+    business_id: str
+    name: str
+    city: str
+    state: str
+    latitude: float
+    longitude: float
+    categories: list[str]
+
+
+@dataclass
+class VisitEvent:
+    user_id: str
+    business_id: str
+    date_text: str
+    timestamp: datetime
+    source: str
+    line_no: int
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build a train/test protocol by holding out each user's latest visit as ground truth, "
+            "then generating query/candidate files and rebuilding train-side user profiles."
+        )
+    )
+    parser.add_argument(
+        "--data-prefix",
+        default="yelp-indianapolis",
+        help="Input subset prefix. Expected files: data/<prefix>-*.jsonl or .json",
+    )
+    parser.add_argument(
+        "--train-prefix",
+        default="",
+        help="Output train prefix. Default: <data-prefix>-train",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default="data",
+        help="Data directory path (default: data).",
+    )
+    parser.add_argument(
+        "--max-users",
+        type=int,
+        default=0,
+        help="Maximum users to include in test set. 0 means all users with visits.",
+    )
+    parser.add_argument(
+        "--candidate-size",
+        type=int,
+        default=100,
+        help="Candidate set size per query (default: 100).",
+    )
+    parser.add_argument(
+        "--hard-negative-ratio",
+        type=float,
+        default=0.5,
+        help="Ratio of hard negatives from same city/category (default: 0.5).",
+    )
+    parser.add_argument(
+        "--query-generator",
+        choices=["template", "llm"],
+        default="template",
+        help="How to generate synthetic query text (default: template).",
+    )
+    parser.add_argument(
+        "--llm-base-url",
+        default="http://127.0.0.1:1025/v1",
+        help="OpenAI-compatible base URL for local small model server.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default="local-llm",
+        help="Model name used by local server.",
+    )
+    parser.add_argument(
+        "--llm-api-key",
+        default="not-needed",
+        help="API key for local OpenAI-compatible endpoint.",
+    )
+    parser.add_argument(
+        "--llm-temperature",
+        type=float,
+        default=0.7,
+        help="Local LLM temperature for query generation.",
+    )
+    parser.add_argument(
+        "--llm-max-calls",
+        type=int,
+        default=0,
+        help="Maximum LLM calls for query generation. 0 means no limit.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for deterministic protocol generation.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=200000,
+        help="Progress log frequency while scanning large files.",
+    )
+    return parser.parse_args()
+
+
+def resolve_path(data_dir: Path, prefix: str, suffix: str) -> Path:
+    for ext in (".jsonl", ".json"):
+        path = data_dir / f"{prefix}-{suffix}{ext}"
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        f"Cannot find {prefix}-{suffix}.jsonl/.json under {data_dir}"
+    )
+
+
+def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def parse_datetime(date_text: str) -> datetime | None:
+    date_text = (date_text or "").strip()
+    if not date_text:
+        return None
+    # Yelp uses "YYYY-MM-DD HH:MM:SS".
+    try:
+        return datetime.strptime(date_text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def parse_categories(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    return [x.strip() for x in str(raw).split(",") if x.strip()]
+
+
+def support_level_after_holdout(remaining_visits: int) -> str:
+    if remaining_visits <= 0:
+        return "zero_shot"
+    if remaining_visits <= 10:
+        return "few_shot"
+    return "warm"
+
+
+def perturb_location(
+    lat: float,
+    lon: float,
+    distance_m: float,
+    bearing_rad: float,
+) -> tuple[float, float]:
+    # Great-circle forward approximation for small distances.
+    radius_m = 6_371_000.0
+    d = distance_m / radius_m
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lon)
+
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(d)
+        + math.cos(lat1) * math.sin(d) * math.cos(bearing_rad)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(bearing_rad) * math.sin(d) * math.cos(lat1),
+        math.cos(d) - math.sin(lat1) * math.sin(lat2),
+    )
+    return math.degrees(lat2), math.degrees(lon2)
+
+
+def category_hint(categories: list[str]) -> str:
+    generic = {
+        "restaurants",
+        "food",
+        "nightlife",
+        "bars",
+        "shopping",
+        "local services",
+    }
+    for c in categories:
+        cl = c.strip().lower()
+        if cl and cl not in generic:
+            return c.strip()
+    return categories[0].strip() if categories else "place"
+
+
+def meal_period_from_hour(hour: int) -> str:
+    if 5 <= hour <= 10:
+        return "breakfast"
+    if 11 <= hour <= 14:
+        return "lunch"
+    if 17 <= hour <= 21:
+        return "dinner"
+    return "late-night"
+
+
+def template_query(
+    event: VisitEvent,
+    business: BusinessLite,
+    query_time: datetime,
+    rng: random.Random,
+) -> str:
+    cat = category_hint(business.categories)
+    time_phrase = meal_period_from_hour(query_time.hour)
+    intent_templates = [
+        "Looking for a {cat} option for {time_phrase} near me.",
+        "Any good {cat} place around here right now for {time_phrase}?",
+        "Need a nearby {cat} spot with a decent vibe this {time_phrase}.",
+        "Can you recommend a {cat} place close to my location?",
+        "I want a {cat} place nearby, open now and worth trying.",
+    ]
+    return rng.choice(intent_templates).format(cat=cat, time_phrase=time_phrase)
+
+
+class LocalLLMQueryGenerator:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: str,
+        temperature: float,
+        max_calls: int,
+    ) -> None:
+        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.model = model
+        self.temperature = temperature
+        self.max_calls = max_calls
+        self.calls = 0
+
+    def can_call(self) -> bool:
+        return self.max_calls <= 0 or self.calls < self.max_calls
+
+    def generate(
+        self,
+        event: VisitEvent,
+        business: BusinessLite,
+        query_time: datetime,
+        remaining_visits: int,
+    ) -> str | None:
+        if not self.can_call():
+            return None
+        self.calls += 1
+        cat_hint = category_hint(business.categories)
+        support = support_level_after_holdout(remaining_visits)
+        system_prompt = (
+            "You create one natural user query for real-time POI recommendation.\n"
+            "Constraints:\n"
+            "- Do not mention any business name, address, coordinates, or business ID.\n"
+            "- Keep the query concise (5-20 words).\n"
+            "- Mention intent and near-me context.\n"
+            "- Output valid JSON only: {\"query\": \"...\"}."
+        )
+        user_payload = {
+            "time_local": query_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "hour": query_time.hour,
+            "city": business.city,
+            "state": business.state,
+            "category_hint": cat_hint,
+            "support_level": support,
+            "remaining_visits_after_holdout": remaining_visits,
+        }
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(user_payload, ensure_ascii=False),
+                    },
+                ],
+                response_format={"type": "json_object"},
+                temperature=self.temperature,
+            )
+            raw = response.choices[0].message.content or "{}"
+            if isinstance(raw, list):
+                raw = "".join(
+                    item.get("text", "") for item in raw if isinstance(item, dict)
+                )
+            row = json.loads(raw)
+            query = str(row.get("query", "")).strip()
+            if not query:
+                return None
+            # Basic leakage guard.
+            lower = query.lower()
+            if business.name and business.name.lower() in lower:
+                return None
+            return query
+        except Exception:
+            return None
+
+
+def load_businesses(path: Path) -> dict[str, BusinessLite]:
+    businesses: dict[str, BusinessLite] = {}
+    for row in iter_jsonl(path):
+        bid = str(row.get("business_id", "")).strip()
+        if not bid:
+            continue
+        businesses[bid] = BusinessLite(
+            business_id=bid,
+            name=str(row.get("name", "")).strip(),
+            city=str(row.get("city", "")).strip(),
+            state=str(row.get("state", "")).strip(),
+            latitude=float(row.get("latitude", 0.0)),
+            longitude=float(row.get("longitude", 0.0)),
+            categories=parse_categories(row.get("categories")),
+        )
+    if not businesses:
+        raise ValueError(f"No businesses loaded from: {path}")
+    return businesses
+
+
+def collect_last_visits(
+    review_path: Path,
+    tip_path: Path,
+    valid_business_ids: set[str],
+    progress_every: int,
+) -> tuple[dict[str, VisitEvent], dict[str, int], set[int], set[int]]:
+    user_counts: dict[str, int] = Counter()
+    latest: dict[str, VisitEvent] = {}
+    drop_review_lines: set[int] = set()
+    drop_tip_lines: set[int] = set()
+
+    for i, row in enumerate(iter_jsonl(review_path), 1):
+        uid = str(row.get("user_id", "")).strip()
+        bid = str(row.get("business_id", "")).strip()
+        dt = parse_datetime(str(row.get("date", "")))
+        if not uid or not bid or bid not in valid_business_ids or dt is None:
+            continue
+        user_counts[uid] += 1
+        event = VisitEvent(
+            user_id=uid,
+            business_id=bid,
+            date_text=str(row.get("date", "")).strip(),
+            timestamp=dt,
+            source="review",
+            line_no=i,
+        )
+        prev = latest.get(uid)
+        if prev is None or event.timestamp >= prev.timestamp:
+            latest[uid] = event
+        if i % progress_every == 0:
+            print(f"  review scanned: {i:,}")
+
+    for i, row in enumerate(iter_jsonl(tip_path), 1):
+        uid = str(row.get("user_id", "")).strip()
+        bid = str(row.get("business_id", "")).strip()
+        dt = parse_datetime(str(row.get("date", "")))
+        if not uid or not bid or bid not in valid_business_ids or dt is None:
+            continue
+        user_counts[uid] += 1
+        event = VisitEvent(
+            user_id=uid,
+            business_id=bid,
+            date_text=str(row.get("date", "")).strip(),
+            timestamp=dt,
+            source="tip",
+            line_no=i,
+        )
+        prev = latest.get(uid)
+        if prev is None or event.timestamp >= prev.timestamp:
+            latest[uid] = event
+        if i % progress_every == 0:
+            print(f"  tip scanned: {i:,}")
+
+    for uid, event in latest.items():
+        if event.source == "review":
+            drop_review_lines.add(event.line_no)
+        else:
+            drop_tip_lines.add(event.line_no)
+
+    return latest, user_counts, drop_review_lines, drop_tip_lines
+
+
+def build_candidate_index(
+    businesses: dict[str, BusinessLite],
+) -> tuple[dict[str, list[str]], dict[str, list[str]], list[str]]:
+    city_index: dict[str, list[str]] = defaultdict(list)
+    category_index: dict[str, list[str]] = defaultdict(list)
+    all_ids: list[str] = []
+    for bid, b in businesses.items():
+        all_ids.append(bid)
+        city_key = b.city.lower()
+        city_index[city_key].append(bid)
+        for cat in b.categories:
+            category_index[cat.lower()].append(bid)
+    return city_index, category_index, all_ids
+
+
+def make_candidate_set(
+    gt_business_id: str,
+    business: BusinessLite,
+    city_index: dict[str, list[str]],
+    category_index: dict[str, list[str]],
+    all_business_ids: list[str],
+    candidate_size: int,
+    hard_negative_ratio: float,
+    rng: random.Random,
+) -> list[str]:
+    target_size = max(2, candidate_size)
+    hard_target = int((target_size - 1) * max(0.0, min(1.0, hard_negative_ratio)))
+    picked = [gt_business_id]
+    picked_set = {gt_business_id}
+
+    # Hard negatives: same city and same category as much as possible.
+    hard_pool: list[str] = []
+    city_pool = city_index.get(business.city.lower(), [])
+    category_pools = [category_index.get(c.lower(), []) for c in business.categories]
+    for cat_pool in category_pools:
+        for bid in cat_pool:
+            if bid == gt_business_id:
+                continue
+            if bid in picked_set:
+                continue
+            # Keep mostly city-consistent hard negatives first.
+            if bid in city_pool:
+                hard_pool.append(bid)
+    rng.shuffle(hard_pool)
+    for bid in hard_pool:
+        if len(picked) >= 1 + hard_target:
+            break
+        if bid not in picked_set:
+            picked.append(bid)
+            picked_set.add(bid)
+
+    # Medium negatives: same city.
+    medium_pool = [bid for bid in city_pool if bid not in picked_set]
+    rng.shuffle(medium_pool)
+    for bid in medium_pool:
+        if len(picked) >= target_size:
+            break
+        picked.append(bid)
+        picked_set.add(bid)
+
+    # Easy negatives: global random fill.
+    if len(picked) < target_size:
+        global_pool = [bid for bid in all_business_ids if bid not in picked_set]
+        rng.shuffle(global_pool)
+        for bid in global_pool:
+            if len(picked) >= target_size:
+                break
+            picked.append(bid)
+            picked_set.add(bid)
+
+    rng.shuffle(picked)
+    return picked[:target_size]
+
+
+def write_filtered_train_files(
+    data_dir: Path,
+    input_prefix: str,
+    train_prefix: str,
+    users_with_visits: set[str],
+    drop_review_lines: set[int],
+    drop_tip_lines: set[int],
+) -> dict[str, int]:
+    in_business = resolve_path(data_dir, input_prefix, "business")
+    in_review = resolve_path(data_dir, input_prefix, "review")
+    in_tip = resolve_path(data_dir, input_prefix, "tip")
+    in_user = resolve_path(data_dir, input_prefix, "user")
+    in_checkin = resolve_path(data_dir, input_prefix, "checkin")
+
+    out_business = data_dir / f"{train_prefix}-business.jsonl"
+    out_review = data_dir / f"{train_prefix}-review.jsonl"
+    out_tip = data_dir / f"{train_prefix}-tip.jsonl"
+    out_user = data_dir / f"{train_prefix}-user.jsonl"
+    out_checkin = data_dir / f"{train_prefix}-checkin.jsonl"
+
+    stats = {
+        "review_removed_as_gt": 0,
+        "tip_removed_as_gt": 0,
+        "review_out": 0,
+        "tip_out": 0,
+        "user_out": 0,
+    }
+
+    # Business and checkin are copied directly because ground-truth holdout is interaction-level.
+    out_business.write_bytes(in_business.read_bytes())
+    out_checkin.write_bytes(in_checkin.read_bytes())
+
+    with in_review.open("r", encoding="utf-8") as fr, out_review.open(
+        "w", encoding="utf-8"
+    ) as fw:
+        for i, line in enumerate(fr, 1):
+            if i in drop_review_lines:
+                stats["review_removed_as_gt"] += 1
+                continue
+            fw.write(line)
+            stats["review_out"] += 1
+
+    with in_tip.open("r", encoding="utf-8") as fr, out_tip.open("w", encoding="utf-8") as fw:
+        for i, line in enumerate(fr, 1):
+            if i in drop_tip_lines:
+                stats["tip_removed_as_gt"] += 1
+                continue
+            fw.write(line)
+            stats["tip_out"] += 1
+
+    with in_user.open("r", encoding="utf-8") as fr, out_user.open("w", encoding="utf-8") as fw:
+        for line in fr:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            try:
+                row = json.loads(line_stripped)
+            except json.JSONDecodeError:
+                continue
+            uid = str(row.get("user_id", "")).strip()
+            if uid and uid in users_with_visits:
+                fw.write(line if line.endswith("\n") else line + "\n")
+                stats["user_out"] += 1
+
+    return stats
+
+
+def run_profile_builder(data_dir: Path, train_prefix: str) -> None:
+    cmd = [
+        sys.executable,
+        str(PROJECT_ROOT / "utils" / "build_user_profile.py"),
+        "--data-prefix",
+        train_prefix,
+        "--data-dir",
+        str(data_dir),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def main() -> None:
+    args = parse_args()
+    rng = random.Random(args.seed)
+    data_dir = Path(args.data_dir)
+    input_prefix = args.data_prefix.strip()
+    train_prefix = args.train_prefix.strip() or f"{input_prefix}-train"
+
+    business_path = resolve_path(data_dir, input_prefix, "business")
+    review_path = resolve_path(data_dir, input_prefix, "review")
+    tip_path = resolve_path(data_dir, input_prefix, "tip")
+    user_path = resolve_path(data_dir, input_prefix, "user")
+    _ = user_path  # Explicitly resolved to fail-fast if missing.
+
+    query_output = data_dir / f"{input_prefix}-eval-queries.jsonl"
+    candidate_output = data_dir / f"{input_prefix}-eval-candidates.jsonl"
+    meta_output = data_dir / f"{input_prefix}-eval-meta.json"
+
+    print(f"[1/7] Loading business map: {business_path}")
+    businesses = load_businesses(business_path)
+    print(f"  businesses loaded: {len(businesses):,}")
+
+    print("[2/7] Scanning latest user visits from review/tip")
+    latest, visit_counts, drop_review_lines, drop_tip_lines = collect_last_visits(
+        review_path=review_path,
+        tip_path=tip_path,
+        valid_business_ids=set(businesses.keys()),
+        progress_every=args.progress_every,
+    )
+    users_with_visits = {u for u, c in visit_counts.items() if c > 0}
+    if not latest:
+        raise ValueError("No valid user visits found. Cannot build evaluation protocol.")
+    print(
+        f"  users_with_visits={len(users_with_visits):,}, "
+        f"holdout_events={len(latest):,}"
+    )
+
+    city_index, category_index, all_business_ids = build_candidate_index(businesses)
+
+    llm_generator: LocalLLMQueryGenerator | None = None
+    if args.query_generator == "llm":
+        llm_generator = LocalLLMQueryGenerator(
+            base_url=args.llm_base_url,
+            model=args.llm_model,
+            api_key=args.llm_api_key,
+            temperature=args.llm_temperature,
+            max_calls=args.llm_max_calls,
+        )
+
+    print("[3/7] Building eval query and candidate files")
+    selected_users = sorted(latest.keys())
+    if args.max_users > 0:
+        selected_users = selected_users[: args.max_users]
+
+    query_count = 0
+    llm_success = 0
+    llm_fallback = 0
+    with query_output.open("w", encoding="utf-8") as fq, candidate_output.open(
+        "w", encoding="utf-8"
+    ) as fc:
+        for uid in selected_users:
+            event = latest[uid]
+            b = businesses.get(event.business_id)
+            if b is None:
+                continue
+
+            back_minutes = rng.randint(5, 30)
+            query_time = event.timestamp - timedelta(minutes=back_minutes)
+            move_meters = rng.uniform(100.0, 500.0)
+            bearing = rng.uniform(0.0, 2.0 * math.pi)
+            q_lat, q_lon = perturb_location(
+                lat=b.latitude,
+                lon=b.longitude,
+                distance_m=move_meters,
+                bearing_rad=bearing,
+            )
+
+            remaining = max(0, visit_counts[uid] - 1)
+            query_text = None
+            if llm_generator is not None:
+                query_text = llm_generator.generate(
+                    event=event,
+                    business=b,
+                    query_time=query_time,
+                    remaining_visits=remaining,
+                )
+                if query_text:
+                    llm_success += 1
+                else:
+                    llm_fallback += 1
+            if not query_text:
+                query_text = template_query(event, b, query_time, rng)
+
+            query_id = f"{input_prefix}-{uid}-{event.source}-{event.line_no}"
+            query_row = {
+                "query_id": query_id,
+                "user_id": uid,
+                "query_text": query_text,
+                "query_local_time": query_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "query_location": {
+                    "lat": round(q_lat, 6),
+                    "lon": round(q_lon, 6),
+                },
+                "ground_truth": {
+                    "business_id": event.business_id,
+                    "visit_time": event.date_text,
+                    "source": event.source,
+                },
+                "perturbation": {
+                    "time_back_minutes": back_minutes,
+                    "distance_meters": round(move_meters, 3),
+                },
+                "evaluation_slice": {
+                    "remaining_visits_after_holdout": remaining,
+                    "support_level_after_holdout": support_level_after_holdout(remaining),
+                    "city": b.city,
+                    "state": b.state,
+                },
+            }
+            fq.write(json.dumps(query_row, ensure_ascii=False) + "\n")
+
+            candidate_ids = make_candidate_set(
+                gt_business_id=event.business_id,
+                business=b,
+                city_index=city_index,
+                category_index=category_index,
+                all_business_ids=all_business_ids,
+                candidate_size=args.candidate_size,
+                hard_negative_ratio=args.hard_negative_ratio,
+                rng=rng,
+            )
+            candidate_row = {
+                "query_id": query_id,
+                "user_id": uid,
+                "ground_truth_business_id": event.business_id,
+                "candidate_business_ids": candidate_ids,
+            }
+            fc.write(json.dumps(candidate_row, ensure_ascii=False) + "\n")
+
+            query_count += 1
+            if query_count % 50000 == 0:
+                print(f"  queries built: {query_count:,}")
+
+    print(f"  eval queries built: {query_count:,}")
+
+    print("[4/7] Writing train split files with held-out interactions removed")
+    split_stats = write_filtered_train_files(
+        data_dir=data_dir,
+        input_prefix=input_prefix,
+        train_prefix=train_prefix,
+        users_with_visits=users_with_visits,
+        drop_review_lines=drop_review_lines,
+        drop_tip_lines=drop_tip_lines,
+    )
+
+    print("[5/7] Rebuilding train-side user profiles")
+    run_profile_builder(data_dir, train_prefix)
+
+    print("[6/7] Writing protocol metadata")
+    meta = {
+        "input_prefix": input_prefix,
+        "train_prefix": train_prefix,
+        "seed": args.seed,
+        "query_generator": args.query_generator,
+        "llm_base_url": args.llm_base_url if args.query_generator == "llm" else "",
+        "llm_model": args.llm_model if args.query_generator == "llm" else "",
+        "llm_temperature": args.llm_temperature if args.query_generator == "llm" else 0.0,
+        "llm_success_count": llm_success,
+        "llm_fallback_to_template_count": llm_fallback,
+        "candidate_size": args.candidate_size,
+        "hard_negative_ratio": args.hard_negative_ratio,
+        "users_with_visits": len(users_with_visits),
+        "held_out_events": len(latest),
+        "eval_queries_count": query_count,
+        "files": {
+            "eval_queries": str(query_output),
+            "eval_candidates": str(candidate_output),
+            "train_business": str(data_dir / f"{train_prefix}-business.jsonl"),
+            "train_review": str(data_dir / f"{train_prefix}-review.jsonl"),
+            "train_tip": str(data_dir / f"{train_prefix}-tip.jsonl"),
+            "train_user": str(data_dir / f"{train_prefix}-user.jsonl"),
+            "train_checkin": str(data_dir / f"{train_prefix}-checkin.jsonl"),
+            "train_profile": str(data_dir / f"{train_prefix}-profile.jsonl"),
+        },
+        "split_stats": split_stats,
+    }
+    with meta_output.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    print("[7/7] Done")
+    print(json.dumps(meta, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+
