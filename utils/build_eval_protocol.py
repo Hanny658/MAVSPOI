@@ -63,10 +63,29 @@ def parse_args() -> argparse.Namespace:
         help="Data directory path (default: data).",
     )
     parser.add_argument(
+        "--train-dir",
+        default="train",
+        help="Train output subdirectory under data-dir (default: train).",
+    )
+    parser.add_argument(
+        "--eval-dir",
+        default="eval",
+        help="Evaluation output subdirectory under data-dir (default: eval).",
+    )
+    parser.add_argument(
         "--max-users",
         type=int,
         default=0,
-        help="Maximum users to include in test set. 0 means all users with visits.",
+        help="(Deprecated) Maximum users to include. Use --sample-size instead.",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=500,
+        help=(
+            "Randomly sample this many users for evaluation holdout. "
+            "0 means use all users with visits. Default: 500."
+        ),
     )
     parser.add_argument(
         "--candidate-size",
@@ -345,11 +364,9 @@ def collect_last_visits(
     tip_path: Path,
     valid_business_ids: set[str],
     progress_every: int,
-) -> tuple[dict[str, VisitEvent], dict[str, int], set[int], set[int]]:
+) -> tuple[dict[str, VisitEvent], dict[str, int]]:
     user_counts: dict[str, int] = Counter()
     latest: dict[str, VisitEvent] = {}
-    drop_review_lines: set[int] = set()
-    drop_tip_lines: set[int] = set()
 
     for i, row in enumerate(iter_jsonl(review_path), 1):
         uid = str(row.get("user_id", "")).strip()
@@ -393,13 +410,7 @@ def collect_last_visits(
         if i % progress_every == 0:
             print(f"  tip scanned: {i:,}")
 
-    for uid, event in latest.items():
-        if event.source == "review":
-            drop_review_lines.add(event.line_no)
-        else:
-            drop_tip_lines.add(event.line_no)
-
-    return latest, user_counts, drop_review_lines, drop_tip_lines
+    return latest, user_counts
 
 
 def build_candidate_index(
@@ -478,6 +489,7 @@ def make_candidate_set(
 
 def write_filtered_train_files(
     data_dir: Path,
+    train_output_dir: Path,
     input_prefix: str,
     train_prefix: str,
     users_with_visits: set[str],
@@ -490,11 +502,12 @@ def write_filtered_train_files(
     in_user = resolve_path(data_dir, input_prefix, "user")
     in_checkin = resolve_path(data_dir, input_prefix, "checkin")
 
-    out_business = data_dir / f"{train_prefix}-business.jsonl"
-    out_review = data_dir / f"{train_prefix}-review.jsonl"
-    out_tip = data_dir / f"{train_prefix}-tip.jsonl"
-    out_user = data_dir / f"{train_prefix}-user.jsonl"
-    out_checkin = data_dir / f"{train_prefix}-checkin.jsonl"
+    train_output_dir.mkdir(parents=True, exist_ok=True)
+    out_business = train_output_dir / f"{train_prefix}-business.jsonl"
+    out_review = train_output_dir / f"{train_prefix}-review.jsonl"
+    out_tip = train_output_dir / f"{train_prefix}-tip.jsonl"
+    out_user = train_output_dir / f"{train_prefix}-user.jsonl"
+    out_checkin = train_output_dir / f"{train_prefix}-checkin.jsonl"
 
     stats = {
         "review_removed_as_gt": 0,
@@ -543,14 +556,14 @@ def write_filtered_train_files(
     return stats
 
 
-def run_profile_builder(data_dir: Path, train_prefix: str) -> None:
+def run_profile_builder(train_output_dir: Path, train_prefix: str) -> None:
     cmd = [
         sys.executable,
         str(PROJECT_ROOT / "utils" / "build_user_profile.py"),
         "--data-prefix",
         train_prefix,
         "--data-dir",
-        str(data_dir),
+        str(train_output_dir),
     ]
     subprocess.run(cmd, check=True)
 
@@ -559,6 +572,10 @@ def main() -> None:
     args = parse_args()
     rng = random.Random(args.seed)
     data_dir = Path(args.data_dir)
+    train_output_dir = data_dir / args.train_dir
+    eval_output_dir = data_dir / args.eval_dir
+    train_output_dir.mkdir(parents=True, exist_ok=True)
+    eval_output_dir.mkdir(parents=True, exist_ok=True)
     input_prefix = args.data_prefix.strip()
     train_prefix = args.train_prefix.strip() or f"{input_prefix}-train"
 
@@ -568,16 +585,18 @@ def main() -> None:
     user_path = resolve_path(data_dir, input_prefix, "user")
     _ = user_path  # Explicitly resolved to fail-fast if missing.
 
-    query_output = data_dir / f"{input_prefix}-eval-queries.jsonl"
-    candidate_output = data_dir / f"{input_prefix}-eval-candidates.jsonl"
-    meta_output = data_dir / f"{input_prefix}-eval-meta.json"
+    query_output = eval_output_dir / f"{input_prefix}-eval-queries.jsonl"
+    candidate_output = eval_output_dir / f"{input_prefix}-eval-candidates.jsonl"
+    meta_output = eval_output_dir / f"{input_prefix}-eval-meta.json"
+    query_tmp = eval_output_dir / f"{input_prefix}-eval-queries.jsonl.tmp"
+    candidate_tmp = eval_output_dir / f"{input_prefix}-eval-candidates.jsonl.tmp"
 
     print(f"[1/7] Loading business map: {business_path}")
     businesses = load_businesses(business_path)
     print(f"  businesses loaded: {len(businesses):,}")
 
     print("[2/7] Scanning latest user visits from review/tip")
-    latest, visit_counts, drop_review_lines, drop_tip_lines = collect_last_visits(
+    latest, visit_counts = collect_last_visits(
         review_path=review_path,
         tip_path=tip_path,
         valid_business_ids=set(businesses.keys()),
@@ -603,19 +622,36 @@ def main() -> None:
             max_calls=args.llm_max_calls,
         )
 
-    print("[3/7] Building eval query and candidate files")
-    selected_users = sorted(latest.keys())
-    if args.max_users > 0:
-        selected_users = selected_users[: args.max_users]
+    print("[3/7] Sampling evaluation users and building query/candidate files")
+    all_users = list(latest.keys())
+    rng.shuffle(all_users)
+
+    # Prefer sample-size. max-users is kept for backward compatibility.
+    sample_limit = args.sample_size if args.sample_size > 0 else 0
+    if sample_limit <= 0 and args.max_users > 0:
+        sample_limit = args.max_users
+    selected_users = all_users[:sample_limit] if sample_limit > 0 else all_users
+
+    selected_latest = {uid: latest[uid] for uid in selected_users}
+    drop_review_lines = {
+        event.line_no
+        for event in selected_latest.values()
+        if event.source == "review"
+    }
+    drop_tip_lines = {
+        event.line_no
+        for event in selected_latest.values()
+        if event.source == "tip"
+    }
 
     query_count = 0
     llm_success = 0
     llm_fallback = 0
-    with query_output.open("w", encoding="utf-8") as fq, candidate_output.open(
+    with query_tmp.open("w", encoding="utf-8") as fq, candidate_tmp.open(
         "w", encoding="utf-8"
     ) as fc:
         for uid in selected_users:
-            event = latest[uid]
+            event = selected_latest[uid]
             b = businesses.get(event.business_id)
             if b is None:
                 continue
@@ -697,11 +733,16 @@ def main() -> None:
             if query_count % 50000 == 0:
                 print(f"  queries built: {query_count:,}")
 
+    # Atomic replace to avoid leaving corrupted output files after interrupted runs.
+    query_tmp.replace(query_output)
+    candidate_tmp.replace(candidate_output)
+
     print(f"  eval queries built: {query_count:,}")
 
     print("[4/7] Writing train split files with held-out interactions removed")
     split_stats = write_filtered_train_files(
         data_dir=data_dir,
+        train_output_dir=train_output_dir,
         input_prefix=input_prefix,
         train_prefix=train_prefix,
         users_with_visits=users_with_visits,
@@ -710,7 +751,7 @@ def main() -> None:
     )
 
     print("[5/7] Rebuilding train-side user profiles")
-    run_profile_builder(data_dir, train_prefix)
+    run_profile_builder(train_output_dir, train_prefix)
 
     print("[6/7] Writing protocol metadata")
     meta = {
@@ -726,17 +767,22 @@ def main() -> None:
         "candidate_size": args.candidate_size,
         "hard_negative_ratio": args.hard_negative_ratio,
         "users_with_visits": len(users_with_visits),
-        "held_out_events": len(latest),
+        "held_out_events": len(selected_latest),
+        "sampling": {
+            "all_eligible_users": len(all_users),
+            "sample_size": len(selected_users),
+            "seed": args.seed,
+        },
         "eval_queries_count": query_count,
         "files": {
             "eval_queries": str(query_output),
             "eval_candidates": str(candidate_output),
-            "train_business": str(data_dir / f"{train_prefix}-business.jsonl"),
-            "train_review": str(data_dir / f"{train_prefix}-review.jsonl"),
-            "train_tip": str(data_dir / f"{train_prefix}-tip.jsonl"),
-            "train_user": str(data_dir / f"{train_prefix}-user.jsonl"),
-            "train_checkin": str(data_dir / f"{train_prefix}-checkin.jsonl"),
-            "train_profile": str(data_dir / f"{train_prefix}-profile.jsonl"),
+            "train_business": str(train_output_dir / f"{train_prefix}-business.jsonl"),
+            "train_review": str(train_output_dir / f"{train_prefix}-review.jsonl"),
+            "train_tip": str(train_output_dir / f"{train_prefix}-tip.jsonl"),
+            "train_user": str(train_output_dir / f"{train_prefix}-user.jsonl"),
+            "train_checkin": str(train_output_dir / f"{train_prefix}-checkin.jsonl"),
+            "train_profile": str(train_output_dir / f"{train_prefix}-profile.jsonl"),
         },
         "split_stats": split_stats,
     }
@@ -749,4 +795,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
