@@ -210,3 +210,7 @@ __marimo__/
 data/
 *.crdownload
 coma_poi_paper*
+
+# misc
+.python-version
+*.bkp
