@@ -46,6 +46,6 @@ def load_settings() -> Settings:
         forecaster_top_k=_get_int("FORECASTER_TOP_K", 25),
         final_top_k=_get_int("FINAL_TOP_K", 10),
         embed_cache_path=os.getenv(
-            "EMBED_CACHE_PATH", "data/cache/yelp-indianapolis-train-business-embeddings.jsonl"
+            "EMBED_CACHE_PATH", "data/cache/yelp-indianapolis-train-business-embeddings.faiss"
         ).strip(),
     )

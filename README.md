@@ -66,9 +66,10 @@ For the CoMaPOI-styled inference pipeline, only two files are required:
 - `data/<prefix>-business.jsonl`
 - `data/<prefix>-profile.jsonl`
 
-Current pipeline reads business + profile, and builds embedding cache at:
+Current pipeline reads business + profile, and stores embeddings in a FAISS index at:
 
-- `data/cache/yelp_business_embeddings.jsonl`
+- `data/cache/yelp-indianapolis-train-business-embeddings.faiss`
+- Sidecar ID map: `*.faiss.ids.json`
 
 If you want a city-level subset:
 
