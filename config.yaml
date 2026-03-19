@@ -23,12 +23,22 @@ mavspoi:
     activation_threshold: 0.45
     fallback_agents: [A1, A3, A4, A6]
     default_max_distance_km: 10.0
-    use_llm: false
+    use_llm: true
     llm_temperature: 0.1
+    hybrid_heuristic_base: 0.45
+    hybrid_llm_base: 0.45
+    hybrid_prior_base: 0.10
 
   voting:
     candidate_pool_size: 30
     neutral_score: 0.5
+    parallel_workers: 7
+    llm_enabled: true
+    llm_temperature: 0.1
+    llm_max_tokens: 1600
+    llm_candidate_limit: 30
+    llm_weight: 0.65
+    heuristic_weight: 0.35
 
   aggregator:
     retrieval_weight: 0.25
