@@ -1,0 +1,17 @@
+runtime:
+  # Train split paths produced by utils/build_eval_protocol.py
+  yelp_business_json: data/train/yelp-indianapolis-train-business.jsonl
+  yelp_profile_json: data/train/yelp-indianapolis-train-profile.jsonl
+
+  # Build-size controls
+  yelp_max_businesses: 50000
+  yelp_city_filter: ""
+
+  # Retrieval and recommendation controls
+  retrieval_top_k: 80
+  forecaster_top_k: 25
+  final_top_k: 10
+
+  # Embedding cache
+  embed_cache_path: data/cache/yelp-indianapolis-train-business-embeddings.faiss
+

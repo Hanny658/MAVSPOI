@@ -196,14 +196,23 @@ Create `.env` from `.env.example` and set:
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
 - `OPENAI_EMBED_MODEL`
-- `YELP_BUSINESS_JSON`
-- `YELP_PROFILE_JSON`
 
-Optional controls:
-- `RETRIEVAL_TOP_K`
-- `FORECASTER_TOP_K`
-- `FINAL_TOP_K`
-- `EMBED_CACHE_PATH`
+Runtime/data/retrieval controls are now read from `config.yaml`:
+```yaml
+runtime:
+  yelp_business_json: data/train/yelp-indianapolis-train-business.jsonl
+  yelp_profile_json: data/train/yelp-indianapolis-train-profile.jsonl
+  yelp_max_businesses: 50000
+  yelp_city_filter: ""
+  retrieval_top_k: 80
+  forecaster_top_k: 25
+  final_top_k: 10
+  embed_cache_path: data/cache/yelp-indianapolis-train-business-embeddings.faiss
+```
+
+Optional:
+- set `CONFIG_YAML_PATH` in `.env` to use another YAML file path.
+- legacy env keys (`YELP_BUSINESS_JSON`, `RETRIEVAL_TOP_K`, etc.) are still accepted as override for backward compatibility.
 
 ## 10. Roadmap
 1. Freeze Router/Voting/Aggregator JSON contracts.
