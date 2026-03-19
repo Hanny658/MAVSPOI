@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from typing import Any
 
@@ -135,7 +136,10 @@ class MAVSPOIRealtimeRecommender:
             embed_cache_path=settings.embed_cache_path,
         )
 
-        self.registry = build_default_registry()
+        self.registry = build_default_registry(
+            llm=self.openai_service,
+            voting_config=self.mav_config.get("voting", {}),
+        )
         self.router = RouterAgent(
             llm=self.openai_service,
             registry=self.registry,
@@ -191,15 +195,31 @@ class MAVSPOIRealtimeRecommender:
         activated_agent_ids: list[str],
     ) -> dict[str, VotingOutput]:
         out: dict[str, VotingOutput] = {}
-        for agent_id in activated_agent_ids:
+        worker_count = int(
+            self.mav_config.get("voting", {}).get("parallel_workers", len(activated_agent_ids))
+        )
+        worker_count = max(1, min(worker_count, max(1, len(activated_agent_ids))))
+
+        def _score(agent_id: str):
             agent = self.registry.get(agent_id)
             if agent is None:
-                continue
-            out[agent_id] = agent.score_candidates(
-                context=context,
-                candidates=candidates,
-                profile_features=profile_features,
-            )
+                return agent_id, None
+            try:
+                result = agent.score_candidates(
+                    context=context,
+                    candidates=candidates,
+                    profile_features=profile_features,
+                )
+                return agent_id, result
+            except Exception:
+                return agent_id, None
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_score, aid) for aid in activated_agent_ids]
+            for fut in as_completed(futures):
+                aid, result = fut.result()
+                if result is not None:
+                    out[aid] = result
         return out
 
     def _finalize_recommendations(
