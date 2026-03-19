@@ -11,6 +11,7 @@ from src.agents.purpose_modality_agent import PurposeModalityAgent
 from src.agents.spatial_feasibility_agent import SpatialFeasibilityAgent
 from src.agents.stable_preference_agent import StablePreferenceAgent
 from src.agents.temporal_feasibility_agent import TemporalFeasibilityAgent
+from src.openai_client import OpenAIService
 
 
 class AgentRegistry:
@@ -44,17 +45,20 @@ class AgentRegistry:
         return out
 
 
-def build_default_registry() -> AgentRegistry:
+def build_default_registry(
+    llm: OpenAIService,
+    voting_config: dict,
+) -> AgentRegistry:
     registry = AgentRegistry()
     registry.register_many(
         [
-            SpatialFeasibilityAgent(),
-            TemporalFeasibilityAgent(),
-            IntentMatchingAgent(),
-            StablePreferenceAgent(),
-            ExplorationAgent(),
-            AvailabilityReliabilityAgent(),
-            PurposeModalityAgent(),
+            SpatialFeasibilityAgent(llm=llm, voting_config=voting_config),
+            TemporalFeasibilityAgent(llm=llm, voting_config=voting_config),
+            IntentMatchingAgent(llm=llm, voting_config=voting_config),
+            StablePreferenceAgent(llm=llm, voting_config=voting_config),
+            ExplorationAgent(llm=llm, voting_config=voting_config),
+            AvailabilityReliabilityAgent(llm=llm, voting_config=voting_config),
+            PurposeModalityAgent(llm=llm, voting_config=voting_config),
         ]
     )
     return registry

@@ -23,6 +23,14 @@ class RouterAgent:
         self.config = config
         self.base_weights = base_weights
 
+    def _support_reliability(self, profile_features: dict[str, Any]) -> float:
+        support_level = str(profile_features.get("support_level", "unknown")).strip().lower()
+        return {"warm": 1.0, "few_shot": 0.72, "zero_shot": 0.45}.get(support_level, 0.5)
+
+    def _query_clarity(self, context: UserQueryContext) -> float:
+        token_count = len(tokenize(context.query_text))
+        return clip01(min(1.0, token_count / 8.0))
+
     def _heuristic_scores(
         self,
         context: UserQueryContext,
@@ -81,6 +89,40 @@ class RouterAgent:
                 out[str(aid)] = clip01(safe_float(score, 0.0))
         return out
 
+    def _hybrid_calibrate(
+        self,
+        agent_id: str,
+        heuristic_score: float,
+        llm_score: float | None,
+        context: UserQueryContext,
+        profile_features: dict[str, Any],
+    ) -> tuple[float, str]:
+        # Hybrid Calibration:
+        # score = weighted blend of heuristic, llm score and prior.
+        # weights are dynamically calibrated by profile reliability and query clarity.
+        support_rel = self._support_reliability(profile_features)
+        clarity = self._query_clarity(context)
+        prior = clip01(safe_float(self.base_weights.get(agent_id, 0.5), 0.5))
+
+        base_heur = clip01(safe_float(self.config.get("hybrid_heuristic_base", 0.45), 0.45))
+        base_llm = clip01(safe_float(self.config.get("hybrid_llm_base", 0.45), 0.45))
+        base_prior = clip01(safe_float(self.config.get("hybrid_prior_base", 0.10), 0.10))
+
+        heur_w = base_heur * (1.0 + (1.0 - support_rel) * 0.35)
+        llm_w = base_llm * clarity
+        prior_w = base_prior
+
+        if llm_score is None:
+            llm_w = 0.0
+        total_w = max(1e-6, heur_w + llm_w + prior_w)
+        combined = (heur_w * heuristic_score + llm_w * (llm_score or 0.0) + prior_w * prior) / total_w
+
+        reason = (
+            f"Hybrid calibration: heuristic_w={heur_w:.2f}, llm_w={llm_w:.2f}, "
+            f"prior_w={prior_w:.2f}, support_rel={support_rel:.2f}, clarity={clarity:.2f}"
+        )
+        return clip01(combined), reason
+
     def run(
         self,
         context: UserQueryContext,
@@ -108,12 +150,14 @@ class RouterAgent:
         ranked: list[tuple[str, float, str]] = []
         for aid in enabled_ids:
             h_score, reason = heuristic.get(aid, (0.5, "No heuristic signal."))
-            if aid in llm_scores:
-                score = 0.5 * h_score + 0.5 * llm_scores[aid]
-                reason = reason + " LLM-merged."
-            else:
-                score = h_score
-            ranked.append((aid, clip01(score), reason))
+            calibrated_score, cal_reason = self._hybrid_calibrate(
+                agent_id=aid,
+                heuristic_score=h_score,
+                llm_score=llm_scores.get(aid),
+                context=context,
+                profile_features=profile_features,
+            )
+            ranked.append((aid, calibrated_score, reason + " " + cal_reason))
         ranked.sort(key=lambda x: x[1], reverse=True)
 
         selected = [row for row in ranked if row[1] >= threshold]
