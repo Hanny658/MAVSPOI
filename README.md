@@ -1,216 +1,180 @@
-# MAVSPOI: Multi-Agent Voting Scheme for real-time POI recommendation
+# MAVSPOI
 
-Current Peogress: CoMaPOI-styled Variant (Frozen LLM, Yelp)
+**Mixture-of-Agents Voting Scheme for POI Recommendation that is context-aware**
 
-This repository now includes a CoMaPOI-styled multi-agent variant for:
+This repository contains:
+- A working **CoMaPOI-styled baseline** (`Profiler -> Forecaster -> Predictor`) on Yelp Open Dataset.
+- A documented target architecture for the next stage: **Router + Sparse Voting Agents + Aggregator**.
 
-- Query-based real-time POI recommendation
-- Frozen LLM via OpenAI API (no fine-tuning)
-- Yelp Open Dataset as POI source
+## 1. Current Status
+Current implemented system:
+- Frozen LLM via OpenAI API (no fine-tuning).
+- FAISS-based retrieval over Yelp businesses.
+- Structured JSON agent outputs with fallback guards.
+- Offline evaluation pipeline with reproducible holdout protocol.
 
-## 1) Architecture Mapping (CoMaPOI -> This Variant)
+Baseline runtime modules:
+- `CoMaPOI_styled/pipeline.py`
+- `CoMaPOI_styled/agents.py`
+- `CoMaPOI_styled/prompts.py`
+- `CoMaPOI_styled/run_query_reco.py`
+- `CoMaPOI_styled/run_eval.py`
 
-- `Profiler` (kept): converts request/context into:
-  - long-term profile (`P_u`)
-  - short-term intent pattern (`M_u`)
-- `Forecaster` (kept): refines retrieval candidates into:
-  - long-term candidate set (`C_H`)
-  - short-term candidate set (`C_C`)
-- `Predictor` (kept): integrates `P_u`, `M_u`, `C_H`, `C_C` and outputs final ranking.
+Shared modules:
+- `src/retrieval.py`, `src/openai_client.py`, `src/schemas.py`
+- `utils/build_eval_protocol.py`, `utils/build_user_profile.py`
 
-Removed from original paper:
+## 2. Fair-Comparison Boundary
+To ensure fair comparison between baseline and MAVSPOI target architecture, keep these fixed:
+- Same train/eval split protocol from `utils/build_eval_protocol.py`.
+- Same user-profile construction from `utils/build_user_profile.py`.
+- Same candidate protocol (`data/eval/*-eval-candidates.jsonl`).
+- Same metrics: `Hit@K`, `Recall@K`, `NDCG@K`, `MRR@K`.
 
-- RRF / LoRA / model fine-tuning.
+## 3. Target MAVSPOI Architecture
 
-## 2) Project Layout
+### 3.1 End-to-End Flow
+1. Retrieval: FAISS candidate generation (shared).
+2. Hard constraints: deterministic filtering before voting.
+3. Router Agent: sparse activation of experts.
+4. Voting Agents: activated experts score candidates in parallel.
+5. Aggregator Agent: deterministic fusion + explanation.
 
-- `src/`: generic components
-  - `config.py`: `.env` settings
-  - `schemas.py`: shared dataclasses
-  - `openai_client.py`: OpenAI chat + embeddings
-  - `profile_loader.py`: load per-user profiles from JSONL
-  - `yelp_loader.py`: Yelp JSONL loader
-  - `retrieval.py`: retrieval and score fusion
-  - `request_simulator.py`: generate time+location query samples
-- `utils/`
-  - `geo.py`: distance utility
-  - `extract_by_city.py`: extract a city-level consistent Yelp subset
-  - `build_user_profile.py`: build per-user profile JSONL from subset files
-  - `build_eval_protocol.py`: build held-out test queries/candidates and train split
-- `CoMaPOI_styled/`: CoMaPOI-specific system
-  - `prompts.py`: structured prompts
-  - `agents.py`: profiler/forecaster/predictor
-  - `pipeline.py`: orchestration
-  - `run_query_reco.py`: CLI entry
-  - `run_eval.py`: batch evaluation on processed eval files
+### 3.2 Router Agent
+Input:
+- Query/session context (time, location, city/state, user id, query text).
+- Compact user profile signals.
+- Candidate summary statistics.
+- Agent registry.
 
-## 3) Setup
+Output:
+- Activated agents with weight/confidence.
+- Global constraints (`max_distance_km`, `open_now`, city constraints).
+- Risk flags (`low_profile_support`, `low_geo_precision`, etc.).
 
-Install dependencies:
+Recommended policy:
+- Multi-label sparse activation (`min_agents`, `max_agents`).
+- Confidence-threshold activation.
+- Low-confidence fallback bundle: `A1 + A3 + A4 + A6`.
 
-```bash
-pip install -r requirements.txt
+### 3.3 Voting Agents (A1-A7)
+All agents output normalized candidate scores in `[0,1]` with confidence in `[0,1]`.
+
+- `A1` Spatial Feasibility Expert  
+  Spatial reachability and detour cost.
+
+- `A2` Temporal Feasibility Expert  
+  Time-window fit, urgency, and period suitability.
+
+- `A3` Intent Matching Expert  
+  Short-term query/session intent alignment.
+
+- `A4` Stable Preference Expert  
+  Long-term interests and habitual preference alignment.
+
+- `A5` Exploration Expert  
+  Novelty/diversity control with repetition penalty.
+
+- `A6` Availability-Reliability Expert  
+  Candidate validity, data freshness, cold-start risk handling.
+
+- `A7` Purpose-Modality Expert  
+  Purpose fit (social/study/work) and online/offline modality fit.
+
+### 3.4 Unified Voting Output Contract
+```json
+{
+  "agent_id": "A1",
+  "results": [
+    {
+      "business_id": "...",
+      "score": 0.73,
+      "confidence": 0.88,
+      "evidence_tags": ["nearby", "low_detour"],
+      "notes": "optional"
+    }
+  ],
+  "agent_status": "ok"
+}
 ```
 
-Create `.env` from `.env.example`, then fill values:
+### 3.5 Aggregator Agent
+Primary strategy:
+- Deterministic weighted fusion for ranking.
+- LLM used mainly for concise explanation and tie rationale.
 
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
-- `OPENAI_EMBED_MODEL`
-- Yelp paths (`YELP_BUSINESS_JSON`, `YELP_PROFILE_JSON`)
+Reference scoring form:
+$$FinalScore(i) = w_r * retrieval(i) + Σ_a [w_a * conf_a(i) * score_a(i)] + bias(i)$$
 
-## 4) Yelp Data Placement
+Where:
+- `w_r` = retrieval baseline weight.
+- `w_a` = router-provided or configured agent weight.
+- `bias(i)` = deterministic correction (for example diversity bonus/repetition penalty).
 
-For the CoMaPOI-styled inference pipeline, only two files are required:
+## 4. Hard Constraints and Safety
+Hard checks (recommended strict):
+- City/state mismatch removal.
+- Max-distance threshold when location is available.
+- Open-now strict filtering when reliable hour data is available.
 
-- `data/<prefix>-business.jsonl`
-- `data/<prefix>-profile.jsonl`
+Soft checks (recommended down-weight):
+- Missing hours.
+- Sparse metadata.
+- Cold-start uncertainty.
 
-Current pipeline reads business + profile, and stores embeddings in a FAISS index at:
+## 5. Evaluation Plan
+Primary metrics:
+- `Hit@K`, `Recall@K`, `NDCG@K`, `MRR@K`
 
-- `data/cache/yelp-indianapolis-train-business-embeddings.faiss`
-- Sidecar ID map: `*.faiss.ids.json`
+Additional diagnostics:
+- Per-agent activation rate.
+- Per-agent contribution share.
+- Router fallback rate.
+- Query latency and token cost.
+- Slice metrics by `zero_shot/few_shot/warm`.
 
-If you want a city-level subset:
+Suggested ablations:
+1. Full MAVSPOI (`Router + A1..A7 + Aggregator`).
+2. Router off (all experts always on).
+3. Leave-one-out (`-A1` ... `-A7`).
+4. Deterministic aggregation vs LLM-heavy aggregation.
 
+## 6. Data Pipeline
+
+### 6.1 Build city-level subset (optional)
 ```bash
 python utils/extract_by_city.py --city Indianapolis --input-dir data --output-dir data
 ```
 
-This creates:
-
-- `data/yelp-indianapolis-business.jsonl`
-- `data/yelp-indianapolis-review.jsonl`
-- `data/yelp-indianapolis-user.jsonl`
-- `data/yelp-indianapolis-checkin.jsonl`
-- `data/yelp-indianapolis-tip.jsonl`
-
-## 5) Run Example
-
+### 6.2 Build eval protocol and train split
 ```bash
-python CoMaPOI_styled/run_query_reco.py ^
-  --query "Need a quiet cafe with good wifi for 2 hours" ^
-  --user-id "some_existing_user_id" ^
-  --city "Las Vegas" ^
-  --state "NV" ^
-  --lat 36.1147 ^
-  --lon -115.1728 ^
-  --local-time "2026-03-09T14:10" ^
-  --long-term-notes "Prefers coffee shops and light meals." ^
-  --recent-activity-notes "Just finished lunch in downtown area."
+python utils/build_eval_protocol.py --data-prefix yelp-indianapolis --data-dir data --sample-size 500
 ```
 
-The output includes:
+Outputs:
+- `data/eval/<prefix>-eval-queries.jsonl`
+- `data/eval/<prefix>-eval-candidates.jsonl`
+- `data/eval/<prefix>-eval-meta.json`
+- `data/train/<prefix>-train-*.jsonl`
 
-- intermediate Profiler/Forecaster outputs
-- compact user profile features injected into the pipeline
-- final ranked recommendations with reasons
-
-The pipeline now supports two retrieval modes:
-
-- `full_corpus`: retrieve from all train businesses
-- `candidate_constrained`: retrieve only within candidate IDs from eval protocol files
-
-## 6) Build User Profiles (No LLM)
-
-Build deterministic per-user profiles from city subset files:
-
+### 6.3 Build user profiles
 ```bash
 python utils/build_user_profile.py --data-prefix yelp-indianapolis --data-dir data
 ```
 
-Input resolution rules:
-
-- Prefer `data/<data_prefix>-*.jsonl`
-- Fallback to `data/<data_prefix>-*.json`
-
-Output:
-
-- `data/<data_prefix>-profile.jsonl`
-
-This file is directly consumed by `CoMaPOI_styled` inference through `YELP_PROFILE_JSON`.
-
-Each profile row includes:
-
-- `support`: explicit `zero_shot` / `few_shot` / `warm` evidence level
-- `coverage`: interaction availability and checkin-context availability
-- `static`: user metadata (fans, friends, elite years, etc.)
-- `rating_behavior`: review-star statistics and feedback signals
-- `temporal_pref`: hour/weekday distributions from review+tip timestamps
-- `category_pref`: top categories and diversity
-- `price_pref`: price-level distribution from business attributes
-- `spatial_pref`: center and movement radius statistics
-- `business_quality_pref`: visited-business quality statistics
-- `checkin_context_pref`: aggregated checkin distributions of visited businesses
-
-This profile design supports fair and quantifiable comparison across:
-
-- `zero_shot` users (no observed interactions)
-- `few_shot` users (limited interactions)
-- `warm` users (sufficient interaction history)
-
-## 7) Notes
-
-- Structured prompts are enforced in every agent with JSON-only output contracts.
-- This design is intentionally split so you can later plug in your own non-CoMaPOI system for fair comparison.
-
-## 8) Build Evaluation Protocol
-
-This pipeline creates a reproducible test protocol and an updated train split:
-
-1. Find each user's latest visit from `review + tip` as ground truth.
-2. Hold out that single latest visit from train interactions.
-3. Simulate a real-time query by:
-   - rolling back time by 5-30 minutes
-   - perturbing location by 100-500 meters
-4. Build candidate sets for each query with guaranteed GT inclusion.
-5. Rebuild train-side user profiles from updated train files.
-
-Run (template query mode, deterministic):
-
+## 7. Run Baseline Inference
 ```bash
-python utils/build_eval_protocol.py --data-prefix yelp-indianapolis --data-dir data
+python CoMaPOI_styled/run_query_reco.py ^
+  --query "Need a quiet cafe with good wifi for 2 hours" ^
+  --user-id "some_existing_user_id" ^
+  --city "Indianapolis" ^
+  --state "IN" ^
+  --lat 39.7684 ^
+  --lon -86.1581
 ```
 
-By default this randomly samples `500` users for protocol generation.  
-Use `--sample-size 0` for full users, or another number (for example `--sample-size 1000`).
-By default outputs go to `data/train/` and `data/eval/`.
-
-Use local small model (llama.cpp OpenAI-compatible server on port 1025):
-
-```bash
-python utils/build_eval_protocol.py ^
-  --data-prefix yelp-indianapolis ^
-  --data-dir data ^
-  --sample-size 500 ^
-  --query-generator llm ^
-  --llm-base-url http://127.0.0.1:1025/v1 ^
-  --llm-model local-llm ^
-  --llm-temperature 0.7
-```
-
-Main outputs:
-
-- `data/eval/<prefix>-eval-queries.jsonl`
-- `data/eval/<prefix>-eval-candidates.jsonl`
-- `data/eval/<prefix>-eval-meta.json`
-- Updated train files:
-  - `data/train/<prefix>-train-business.jsonl`
-  - `data/train/<prefix>-train-review.jsonl`
-  - `data/train/<prefix>-train-tip.jsonl`
-  - `data/train/<prefix>-train-user.jsonl`
-  - `data/train/<prefix>-train-checkin.jsonl`
-  - `data/train/<prefix>-train-profile.jsonl`
-
-Important protocol behavior:
-
-- Users with no valid visits are removed from train user file.
-- Users with exactly one visit become `zero_shot` after holdout (kept for evaluation).
-
-## 9) Evaluate CoMaPOI-styled on Processed Dataset
-
-Run constrained evaluation (recommended, uses `data/eval/*` candidates):
-
+## 8. Run Baseline Evaluation
+Constrained mode:
 ```bash
 python CoMaPOI_styled/run_eval.py ^
   --eval-queries data/eval/yelp-indianapolis-eval-queries.jsonl ^
@@ -219,8 +183,7 @@ python CoMaPOI_styled/run_eval.py ^
   --k-values 1,5,10
 ```
 
-Run full-corpus evaluation:
-
+Full-corpus mode:
 ```bash
 python CoMaPOI_styled/run_eval.py ^
   --eval-queries data/eval/yelp-indianapolis-eval-queries.jsonl ^
@@ -228,10 +191,23 @@ python CoMaPOI_styled/run_eval.py ^
   --k-values 1,5,10
 ```
 
-You can save per-query predictions:
+## 9. Environment
+Create `.env` from `.env.example` and set:
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL`
+- `OPENAI_EMBED_MODEL`
+- `YELP_BUSINESS_JSON`
+- `YELP_PROFILE_JSON`
 
-```bash
-python CoMaPOI_styled/run_eval.py ^
-  --mode constrained ^
-  --save-predictions data/eval/yelp-indianapolis-preds.jsonl
-```
+Optional controls:
+- `RETRIEVAL_TOP_K`
+- `FORECASTER_TOP_K`
+- `FINAL_TOP_K`
+- `EMBED_CACHE_PATH`
+
+## 10. Roadmap
+1. Freeze Router/Voting/Aggregator JSON contracts.
+2. Implement minimum expert set: `A1 + A3 + A4 + A6`.
+3. Add `A2 + A5 + A7` and contribution tracing.
+4. Run full ablations under the same eval protocol.
+5. Report baseline vs MAVSPOI with slice-level analysis.
