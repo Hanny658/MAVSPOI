@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    def load_dotenv() -> None:
+        return None
 
 try:
     import yaml  # type: ignore
@@ -40,6 +44,37 @@ DEFAULTS = {
     "embed_cache_path": "data/cache/yelp-indianapolis-train-business-embeddings.faiss",
 }
 
+DEFAULT_MAVSPOI = {
+    "router": {
+        "enabled_agents": ["A1", "A2", "A3", "A4", "A5", "A6", "A7"],
+        "min_agents": 3,
+        "max_agents": 5,
+        "activation_threshold": 0.45,
+        "fallback_agents": ["A1", "A3", "A4", "A6"],
+        "default_max_distance_km": 10.0,
+        "use_llm": False,
+        "llm_temperature": 0.1,
+    },
+    "voting": {
+        "candidate_pool_size": 30,
+        "neutral_score": 0.5,
+    },
+    "aggregator": {
+        "retrieval_weight": 0.25,
+        "diversity_penalty": 0.04,
+        "neutral_score": 0.5,
+        "weights": {
+            "A1": 0.16,
+            "A2": 0.14,
+            "A3": 0.2,
+            "A4": 0.17,
+            "A5": 0.09,
+            "A6": 0.15,
+            "A7": 0.09,
+        },
+    },
+}
+
 
 def _as_int(value: Any, default: int) -> int:
     try:
@@ -70,6 +105,19 @@ def _load_yaml(path: Path) -> dict[str, Any]:
             )
         return runtime
     return _parse_simple_yaml(path)
+
+
+def _load_yaml_root(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    if yaml is not None:
+        with path.open("r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        if isinstance(raw, dict):
+            return raw
+        return {}
+    # Fallback parser only supports runtime keys; keep empty root in this path.
+    return {}
 
 
 def _parse_simple_scalar(value: str) -> Any:
@@ -141,6 +189,31 @@ def _pick(
     if env_val:
         return env_val
     return base
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    keys = set(base.keys()) | set(override.keys())
+    for key in keys:
+        b_val = base.get(key)
+        o_val = override.get(key)
+        if isinstance(b_val, dict) and isinstance(o_val, dict):
+            out[key] = _deep_merge(b_val, o_val)
+        elif key in override:
+            out[key] = o_val
+        else:
+            out[key] = b_val
+    return out
+
+
+def load_mavspoi_config(config_path: str | None = None) -> dict[str, Any]:
+    load_dotenv()
+    raw_path = config_path or os.getenv("CONFIG_YAML_PATH", DEFAULT_CONFIG_PATH).strip() or DEFAULT_CONFIG_PATH
+    root = _load_yaml_root(Path(raw_path))
+    mav_raw = root.get("mavspoi", {})
+    if not isinstance(mav_raw, dict):
+        mav_raw = {}
+    return _deep_merge(DEFAULT_MAVSPOI, mav_raw)
 
 
 def load_settings() -> Settings:
