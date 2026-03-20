@@ -28,8 +28,53 @@ class RouterAgent:
         return {"warm": 1.0, "few_shot": 0.72, "zero_shot": 0.45}.get(support_level, 0.5)
 
     def _query_clarity(self, context: UserQueryContext) -> float:
-        token_count = len(tokenize(context.query_text))
-        return clip01(min(1.0, token_count / 8.0))
+        tokens = tokenize(context.query_text)
+        if not tokens:
+            return 0.0
+        stop_tokens = {
+            "a",
+            "an",
+            "the",
+            "for",
+            "to",
+            "of",
+            "in",
+            "on",
+            "at",
+            "my",
+            "me",
+            "here",
+            "around",
+            "near",
+            "nearby",
+            "place",
+            "good",
+            "recommend",
+            "want",
+            "need",
+        }
+        signal_tokens = {
+            "now",
+            "today",
+            "tonight",
+            "breakfast",
+            "lunch",
+            "dinner",
+            "urgent",
+            "asap",
+            "quiet",
+            "wifi",
+            "family",
+            "kids",
+            "delivery",
+            "takeout",
+            "date",
+            "party",
+        }
+        informative_ratio = len([t for t in tokens if t not in stop_tokens]) / max(1, len(tokens))
+        length_score = min(1.0, len(tokens) / 12.0)
+        signal_score = min(1.0, len(tokens & signal_tokens) / 2.0)
+        return clip01(0.55 * informative_ratio + 0.3 * length_score + 0.15 * signal_score)
 
     def _heuristic_scores(
         self,
@@ -42,8 +87,9 @@ class RouterAgent:
         has_time_signal = bool(
             query_tokens
             & {"now", "today", "tonight", "lunch", "dinner", "breakfast", "urgent", "asap"}
-        ) or bool(context.local_time.strip())
+        )
         purpose = purpose_label(query_tokens)
+        is_generic = purpose == "generic"
 
         return {
             "A1": (
@@ -59,10 +105,13 @@ class RouterAgent:
                 0.78 if support_level == "warm" else (0.62 if support_level == "few_shot" else 0.45),
                 f"Profile support level: {support_level}.",
             ),
-            "A5": (0.52, "Exploration as secondary signal."),
+            "A5": (
+                0.36 if is_generic else 0.52,
+                "Exploration down-weighted for generic intent." if is_generic else "Exploration as secondary signal.",
+            ),
             "A6": (0.72, "Reliability guardrail enabled."),
             "A7": (
-                0.75 if purpose != "generic" else 0.48,
+                0.75 if purpose != "generic" else 0.35,
                 f"Purpose inferred: {purpose}.",
             ),
         }
@@ -146,6 +195,13 @@ class RouterAgent:
         min_agents = int(safe_float(self.config.get("min_agents", 3), 3))
         max_agents = int(safe_float(self.config.get("max_agents", 5), 5))
         fallback_agents = list(self.config.get("fallback_agents", ["A1", "A3", "A4", "A6"]))
+        support_level = str(profile_features.get("support_level", "unknown")).strip().lower()
+        clarity = self._query_clarity(context)
+        dynamic_max_agents = max_agents
+        if clarity < 0.55:
+            dynamic_max_agents = min(dynamic_max_agents, 4)
+        if support_level in {"zero_shot", "unknown"} and clarity < 0.5:
+            dynamic_max_agents = min(dynamic_max_agents, 3)
 
         ranked: list[tuple[str, float, str]] = []
         for aid in enabled_ids:
@@ -163,7 +219,7 @@ class RouterAgent:
         selected = [row for row in ranked if row[1] >= threshold]
         if len(selected) < min_agents:
             selected = ranked[:min_agents]
-        selected = selected[:max_agents]
+        selected = selected[:dynamic_max_agents]
         if not selected:
             selected = [(aid, 0.5, "Fallback activation.") for aid in fallback_agents[:min_agents]]
 
@@ -184,7 +240,6 @@ class RouterAgent:
                 )
             )
 
-        support_level = str(profile_features.get("support_level", "unknown")).strip().lower()
         risk_flags: list[str] = []
         if support_level in {"zero_shot", "unknown"}:
             risk_flags.append("low_profile_support")
@@ -192,6 +247,8 @@ class RouterAgent:
             risk_flags.append("missing_location")
         if len(tokenize(context.query_text)) <= 2:
             risk_flags.append("ambiguous_query")
+        if clarity < 0.5:
+            risk_flags.append("low_query_specificity")
 
         radius_p90 = safe_float(profile_features.get("radius_km_p90", 0.0), 0.0)
         max_distance = safe_float(self.config.get("default_max_distance_km", 10.0), 10.0)

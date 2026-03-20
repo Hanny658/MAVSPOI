@@ -10,12 +10,20 @@ from src.agents import (
     VotingOutput,
     build_default_registry,
 )
+from src.agents.utils import purpose_label, tokenize
 from src.config import Settings, load_mavspoi_config
 from src.openai_client import OpenAIService
 from src.profile_loader import load_user_profiles
 from src.retrieval import CandidateRetriever
 from src.schemas import CandidateScore, UserQueryContext
 from src.yelp_loader import load_yelp_businesses
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _profile_top_categories(profile: dict[str, Any], limit: int = 5) -> list[str]:
@@ -168,24 +176,60 @@ class MAVSPOIRealtimeRecommender:
         self,
         candidates: list[CandidateScore],
         constraints: dict[str, Any],
-    ) -> list[CandidateScore]:
+    ) -> tuple[list[CandidateScore], dict[str, float], dict[str, list[str]]]:
+        constraint_cfg = self.mav_config.get("constraints", {})
+        open_cfg = constraint_cfg.get("open_now", {})
+        dist_cfg = constraint_cfg.get("max_distance", {})
+
         city = str(constraints.get("city", "")).strip().lower()
         state = str(constraints.get("state", "")).strip().lower()
         open_now = bool(constraints.get("open_now", False))
         max_distance = float(constraints.get("max_distance_km", 0.0) or 0.0)
 
+        open_mode = str(open_cfg.get("mode", "soft")).strip().lower()  # off|soft|hard
+        closed_penalty = _safe_float(open_cfg.get("closed_penalty", 0.12), 0.12)
+
+        dist_mode = str(dist_cfg.get("mode", "soft")).strip().lower()  # off|soft|hard
+        distance_buffer_km = _safe_float(dist_cfg.get("distance_buffer_km", 0.0), 0.0)
+        per_km_penalty = _safe_float(dist_cfg.get("per_km_penalty", 0.03), 0.03)
+        max_distance_penalty = _safe_float(dist_cfg.get("max_penalty", 0.25), 0.25)
+
         output: list[CandidateScore] = []
+        penalties: dict[str, float] = {}
+        penalty_tags: dict[str, list[str]] = {}
         for c in candidates:
             if city and c.business.city.strip().lower() != city:
                 continue
             if state and c.business.state.strip().lower() != state:
                 continue
+            penalty = 0.0
+            tags: list[str] = []
+
             if open_now and int(c.business.is_open) != 1:
-                continue
-            if max_distance > 0 and c.distance_km is not None and float(c.distance_km) > max_distance:
-                continue
+                if open_mode == "hard":
+                    continue
+                if open_mode == "soft":
+                    penalty += closed_penalty
+                    tags.append("penalty_closed_now")
+
+            if (
+                max_distance > 0
+                and c.distance_km is not None
+                and float(c.distance_km) > max_distance + distance_buffer_km
+            ):
+                if dist_mode == "hard":
+                    continue
+                if dist_mode == "soft":
+                    over = float(c.distance_km) - (max_distance + distance_buffer_km)
+                    dist_penalty = min(max_distance_penalty, max(0.0, over) * per_km_penalty)
+                    penalty += dist_penalty
+                    tags.append("penalty_over_distance")
+
             output.append(c)
-        return output or candidates
+            if penalty > 0:
+                penalties[c.business.business_id] = penalty
+                penalty_tags[c.business.business_id] = tags
+        return (output or candidates, penalties, penalty_tags)
 
     def _run_voting(
         self,
@@ -221,6 +265,57 @@ class MAVSPOIRealtimeRecommender:
                 if result is not None:
                     out[aid] = result
         return out
+
+    def _derive_voting_pool_size(
+        self,
+        context: UserQueryContext,
+        profile_features: dict[str, Any],
+        top_k: int,
+        initial_count: int,
+    ) -> int:
+        base_size = int(
+            self.mav_config.get("voting", {}).get(
+                "candidate_pool_size",
+                max(top_k, self.settings.forecaster_top_k),
+            )
+        )
+        base_size = max(top_k, base_size)
+        support_level = str(profile_features.get("support_level", "unknown")).strip().lower()
+        query_tokens = tokenize(context.query_text)
+        purpose = purpose_label(query_tokens)
+        strong_signal_tokens = {
+            "now",
+            "today",
+            "tonight",
+            "breakfast",
+            "lunch",
+            "dinner",
+            "urgent",
+            "asap",
+            "quiet",
+            "wifi",
+            "family",
+            "kids",
+            "delivery",
+            "takeout",
+            "date",
+            "party",
+        }
+        signal_strength = len(query_tokens & strong_signal_tokens)
+
+        adaptive = base_size
+        if purpose == "generic" and signal_strength <= 1:
+            if support_level in {"zero_shot", "unknown"}:
+                adaptive = min(
+                    adaptive,
+                    max(top_k, self.settings.forecaster_top_k),
+                )
+            elif support_level == "few_shot":
+                adaptive = min(
+                    adaptive,
+                    max(top_k, self.settings.forecaster_top_k + 5),
+                )
+        return max(top_k, min(adaptive, initial_count))
 
     def _finalize_recommendations(
         self,
@@ -293,10 +388,12 @@ class MAVSPOIRealtimeRecommender:
             )
             retrieval_mode = "full_corpus"
 
-        voting_pool_size = int(
-            self.mav_config.get("voting", {}).get("candidate_pool_size", max(top_k, self.settings.forecaster_top_k))
+        voting_pool_size = self._derive_voting_pool_size(
+            context=enriched_context,
+            profile_features=profile_features,
+            top_k=top_k,
+            initial_count=len(initial_candidates),
         )
-        voting_pool_size = max(top_k, voting_pool_size)
         candidate_pool = initial_candidates[:voting_pool_size]
 
         router_decision = self.router.run(
@@ -304,7 +401,7 @@ class MAVSPOIRealtimeRecommender:
             profile_features=profile_features,
             candidates=candidate_pool,
         )
-        constrained_pool = self._apply_global_constraints(
+        constrained_pool, constraint_penalties, constraint_tags = self._apply_global_constraints(
             candidates=candidate_pool,
             constraints=router_decision.global_constraints,
         )
@@ -320,6 +417,8 @@ class MAVSPOIRealtimeRecommender:
             votes=votes,
             candidates=constrained_pool,
             top_k=top_k,
+            constraint_penalties=constraint_penalties,
+            constraint_tags=constraint_tags,
         )
         recommendation_rows = [
             {
@@ -348,6 +447,7 @@ class MAVSPOIRealtimeRecommender:
                 "retrieval_pool_size": len(initial_candidates),
                 "voting_pool_size": len(candidate_pool),
                 "post_constraint_pool_size": len(constrained_pool),
+                "constraint_penalty_count": len(constraint_penalties),
                 "router_decision": asdict(router_decision),
                 "activated_agent_count": len(activated_ids),
                 "agent_status": {aid: votes[aid].status for aid in votes},

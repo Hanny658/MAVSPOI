@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -160,6 +161,39 @@ def _agg_finalize(agg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _estimate_eval_total(path: Path, max_queries: int) -> int:
+    total = 0
+    for row in _iter_jsonl(path):
+        query_id = str(row.get("query_id", "")).strip()
+        gt_id = str((row.get("ground_truth") or {}).get("business_id", "")).strip()
+        if not query_id or not gt_id:
+            continue
+        total += 1
+        if max_queries > 0 and total >= max_queries:
+            break
+    return total
+
+
+def _stream_progress(processed: int, total: int, start_ts: float) -> None:
+    total = max(1, total)
+    width = 24
+    ratio = min(1.0, processed / total)
+    filled = int(width * ratio)
+    bar = "#" * filled + "-" * (width - filled)
+    elapsed = max(1e-6, time.time() - start_ts)
+    rate = processed / elapsed if processed > 0 else 0.0
+    if processed > 0 and rate > 0.0:
+        eta_sec = max(0.0, (total - processed) / rate)
+        eta_text = f"{int(eta_sec // 60):02d}:{int(eta_sec % 60):02d}"
+    else:
+        eta_text = "--:--"
+    msg = (
+        f"\rprogress [{bar}] {processed}/{total} "
+        f"({ratio * 100:5.1f}%) | {rate:5.2f} q/s | ETA {eta_text}"
+    )
+    print(msg, end="", file=sys.stderr, flush=True)
+
+
 def main() -> None:
     args = parse_args()
     from SingleAgent.pipeline import SingleAgentRealtimeRecommender
@@ -186,6 +220,11 @@ def main() -> None:
         pred_path = Path(args.save_predictions.strip())
         pred_path.parent.mkdir(parents=True, exist_ok=True)
         pred_writer = pred_path.open("w", encoding="utf-8")
+
+    total = _estimate_eval_total(eval_queries_path, args.max_queries)
+    started = time.time()
+    if total > 0:
+        _stream_progress(0, total, started)
 
     processed = 0
     for row in _iter_jsonl(eval_queries_path):
@@ -234,10 +273,13 @@ def main() -> None:
             )
 
         processed += 1
-        if processed % 50 == 0:
-            print(f"processed={processed}")
+        if total > 0:
+            _stream_progress(processed, total, started)
         if args.max_queries > 0 and processed >= args.max_queries:
             break
+
+    if total > 0:
+        print("", file=sys.stderr, flush=True)
 
     if pred_writer:
         pred_writer.close()
@@ -259,4 +301,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

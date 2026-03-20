@@ -48,8 +48,8 @@ DEFAULT_MAVSPOI = {
     "router": {
         "enabled_agents": ["A1", "A2", "A3", "A4", "A5", "A6", "A7"],
         "min_agents": 3,
-        "max_agents": 5,
-        "activation_threshold": 0.45,
+        "max_agents": 4,
+        "activation_threshold": 0.5,
         "fallback_agents": ["A1", "A3", "A4", "A6"],
         "default_max_distance_km": 10.0,
         "use_llm": True,
@@ -66,12 +66,12 @@ DEFAULT_MAVSPOI = {
         "llm_temperature": 0.1,
         "llm_max_tokens": 1600,
         "llm_candidate_limit": 30,
-        "llm_weight": 0.65,
-        "heuristic_weight": 0.35,
+        "llm_weight": 0.5,
+        "heuristic_weight": 0.5,
     },
     "aggregator": {
-        "retrieval_weight": 0.25,
-        "diversity_penalty": 0.04,
+        "retrieval_weight": 0.34,
+        "diversity_penalty": 0.005,
         "neutral_score": 0.5,
         "weights": {
             "A1": 0.16,
@@ -81,6 +81,18 @@ DEFAULT_MAVSPOI = {
             "A5": 0.09,
             "A6": 0.15,
             "A7": 0.09,
+        },
+    },
+    "constraints": {
+        "open_now": {
+            "mode": "soft",
+            "closed_penalty": 0.12,
+        },
+        "max_distance": {
+            "mode": "soft",
+            "distance_buffer_km": 0.0,
+            "per_km_penalty": 0.03,
+            "max_penalty": 0.25,
         },
     },
 }
