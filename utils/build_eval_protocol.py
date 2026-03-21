@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import subprocess
 import sys
@@ -15,6 +16,12 @@ from typing import Any, Iterable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    def load_dotenv(*args, **kwargs) -> bool:
+        return False
 
 from openai import OpenAI
 
@@ -41,6 +48,7 @@ class VisitEvent:
 
 
 def parse_args() -> argparse.Namespace:
+    load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
     parser = argparse.ArgumentParser(
         description=(
             "Build a train/test protocol by holding out each user's latest visit as ground truth, "
@@ -73,12 +81,6 @@ def parse_args() -> argparse.Namespace:
         help="Evaluation output subdirectory under data-dir (default: eval).",
     )
     parser.add_argument(
-        "--max-users",
-        type=int,
-        default=0,
-        help="(Deprecated) Maximum users to include. Use --sample-size instead.",
-    )
-    parser.add_argument(
         "--sample-size",
         type=int,
         default=500,
@@ -100,37 +102,36 @@ def parse_args() -> argparse.Namespace:
         help="Ratio of hard negatives from same city/category (default: 0.5).",
     )
     parser.add_argument(
-        "--query-generator",
-        choices=["template", "llm"],
-        default="template",
-        help="How to generate synthetic query text (default: template).",
+        "--balance-support",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Whether to balance sampled eval users across zero_shot/few_shot/warm "
+            "based on support level after holdout (default: true)."
+        ),
     )
     parser.add_argument(
         "--llm-base-url",
-        default="http://127.0.0.1:1025/v1",
-        help="OpenAI-compatible base URL for local small model server.",
-    )
-    parser.add_argument(
-        "--llm-model",
-        default="local-llm",
-        help="Model name used by local server.",
-    )
-    parser.add_argument(
-        "--llm-api-key",
-        default="not-needed",
-        help="API key for local OpenAI-compatible endpoint.",
+        default=os.getenv("OPENAI_BASE_URL", "").strip(),
+        help="Optional OpenAI-compatible base URL. Empty means official OpenAI cloud endpoint.",
     )
     parser.add_argument(
         "--llm-temperature",
         type=float,
-        default=0.7,
-        help="Local LLM temperature for query generation.",
+        default=1.1,
+        help="Sampling temperature for diverse cloud query generation.",
     )
     parser.add_argument(
-        "--llm-max-calls",
+        "--llm-top-p",
+        type=float,
+        default=0.95,
+        help="Top-p sampling for diverse cloud query generation.",
+    )
+    parser.add_argument(
+        "--llm-max-retries",
         type=int,
-        default=0,
-        help="Maximum LLM calls for query generation. 0 means no limit.",
+        default=3,
+        help="Maximum retries per query when cloud generation fails.",
     )
     parser.add_argument(
         "--seed",
@@ -194,6 +195,43 @@ def support_level_after_holdout(remaining_visits: int) -> str:
     return "warm"
 
 
+def sample_users_by_support_balance(
+    latest: dict[str, VisitEvent],
+    visit_counts: dict[str, int],
+    sample_limit: int,
+    rng: random.Random,
+) -> tuple[list[str], dict[str, int], dict[str, int]]:
+    order = ["zero_shot", "few_shot", "warm"]
+    buckets: dict[str, list[str]] = {k: [] for k in order}
+    for uid in latest.keys():
+        remaining = max(0, int(visit_counts.get(uid, 0)) - 1)
+        level = support_level_after_holdout(remaining)
+        buckets.setdefault(level, []).append(uid)
+    for level in buckets:
+        rng.shuffle(buckets[level])
+
+    eligible_counts = {level: len(buckets.get(level, [])) for level in order}
+    total_eligible = sum(eligible_counts.values())
+    if sample_limit <= 0 or sample_limit > total_eligible:
+        sample_limit = total_eligible
+
+    selected: list[str] = []
+    selected_counts: Counter[str] = Counter()
+    while len(selected) < sample_limit:
+        non_empty = [level for level in order if buckets.get(level)]
+        if not non_empty:
+            break
+        min_selected = min(selected_counts[level] for level in non_empty)
+        candidates = [level for level in non_empty if selected_counts[level] == min_selected]
+        candidates.sort(key=lambda level: len(buckets[level]), reverse=True)
+        chosen_level = candidates[0]
+        uid = buckets[chosen_level].pop()
+        selected.append(uid)
+        selected_counts[chosen_level] += 1
+
+    return selected, dict(selected_counts), eligible_counts
+
+
 def perturb_location(
     lat: float,
     lon: float,
@@ -243,41 +281,76 @@ def meal_period_from_hour(hour: int) -> str:
     return "late-night"
 
 
-def template_query(
-    event: VisitEvent,
-    business: BusinessLite,
-    query_time: datetime,
-    rng: random.Random,
-) -> str:
-    cat = category_hint(business.categories)
-    time_phrase = meal_period_from_hour(query_time.hour)
-    intent_templates = [
-        "Looking for a {cat} option for {time_phrase} near me.",
-        "Any good {cat} place around here right now for {time_phrase}?",
-        "Need a nearby {cat} spot with a decent vibe this {time_phrase}.",
-        "Can you recommend a {cat} place close to my location?",
-        "I want a {cat} place nearby, open now and worth trying.",
+class CloudLLMQueryGenerator:
+    PROMPT_PROFILES = [
+        {
+            "name": "concise_search",
+            "style_instruction": (
+                "Write like a concise mobile search query. Keep it direct and practical."
+            ),
+            "ambiguity_instruction": "Keep one clear intent but leave optional preferences implicit.",
+        },
+        {
+            "name": "conversational_request",
+            "style_instruction": (
+                "Write like a natural spoken request to an assistant, with colloquial phrasing."
+            ),
+            "ambiguity_instruction": "Be moderately ambiguous: mention need, not exact constraints.",
+        },
+        {
+            "name": "decision_anxiety",
+            "style_instruction": (
+                "Write like a user undecided between options, expressing uncertainty."
+            ),
+            "ambiguity_instruction": "High ambiguity: keep category broad and constraints loose.",
+        },
+        {
+            "name": "task_oriented",
+            "style_instruction": (
+                "Write like task-driven intent (what user wants to do), not only category words."
+            ),
+            "ambiguity_instruction": "Medium ambiguity: include context but not strict filters.",
+        },
+        {
+            "name": "time_pressure",
+            "style_instruction": (
+                "Write like the user is in a hurry and wants a quick recommendation."
+            ),
+            "ambiguity_instruction": "Low ambiguity on urgency, high ambiguity on exact venue type.",
+        },
+        {
+            "name": "vibe_preference",
+            "style_instruction": (
+                "Write like the user cares about vibe/experience (quiet, cozy, lively, etc.)."
+            ),
+            "ambiguity_instruction": "Keep constraints soft and experiential.",
+        },
     ]
-    return rng.choice(intent_templates).format(cat=cat, time_phrase=time_phrase)
 
-
-class LocalLLMQueryGenerator:
     def __init__(
         self,
         base_url: str,
         model: str,
         api_key: str,
         temperature: float,
-        max_calls: int,
+        top_p: float,
+        max_retries: int,
+        rng: random.Random,
     ) -> None:
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        if not api_key.strip():
+            raise ValueError(
+                "Cloud API key is required. Set OPENAI_API_KEY in environment."
+            )
+        if base_url.strip():
+            self.client = OpenAI(base_url=base_url.strip(), api_key=api_key.strip())
+        else:
+            self.client = OpenAI(api_key=api_key.strip())
         self.model = model
         self.temperature = temperature
-        self.max_calls = max_calls
+        self.top_p = top_p
+        self.max_retries = max(1, max_retries)
         self.calls = 0
-
-    def can_call(self) -> bool:
-        return self.max_calls <= 0 or self.calls < self.max_calls
+        self.rng = rng
 
     def generate(
         self,
@@ -285,58 +358,88 @@ class LocalLLMQueryGenerator:
         business: BusinessLite,
         query_time: datetime,
         remaining_visits: int,
-    ) -> str | None:
-        if not self.can_call():
-            return None
-        self.calls += 1
+    ) -> tuple[str, str]:
         cat_hint = category_hint(business.categories)
         support = support_level_after_holdout(remaining_visits)
-        system_prompt = (
-            "You create one natural user query for real-time POI recommendation.\n"
-            "Constraints:\n"
-            "- Do not mention any business name, address, coordinates, or business ID.\n"
-            "- Keep the query concise (5-20 words).\n"
-            "- Mention intent and near-me context.\n"
-            "- Output valid JSON only: {\"query\": \"...\"}."
-        )
-        user_payload = {
-            "time_local": query_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "hour": query_time.hour,
-            "city": business.city,
-            "state": business.state,
-            "category_hint": cat_hint,
-            "support_level": support,
-            "remaining_visits_after_holdout": remaining_visits,
-        }
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": json.dumps(user_payload, ensure_ascii=False),
-                    },
-                ],
-                response_format={"type": "json_object"},
-                temperature=self.temperature,
+        meal_hint = meal_period_from_hour(query_time.hour)
+        last_error = "unknown_error"
+
+        for _ in range(self.max_retries):
+            profile = self.rng.choice(self.PROMPT_PROFILES)
+            system_prompt = (
+                "You generate realistic user queries for a query-based POI recommender.\n"
+                "Hard constraints:\n"
+                "- Do NOT mention business name/address/coordinates/business_id.\n"
+                "- Use natural human wording, avoid rigid templates.\n"
+                "- Keep query length between 6 and 28 words.\n"
+                "- Mention near-me/location context naturally.\n"
+                "- Output JSON only: {\"query\": \"...\", \"style\": \"...\"}.\n"
+                f"Style profile: {profile['name']}\n"
+                f"Style instruction: {profile['style_instruction']}\n"
+                f"Ambiguity instruction: {profile['ambiguity_instruction']}\n"
             )
-            raw = response.choices[0].message.content or "{}"
-            if isinstance(raw, list):
-                raw = "".join(
-                    item.get("text", "") for item in raw if isinstance(item, dict)
+            user_payload = {
+                "time_local": query_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "hour": query_time.hour,
+                "meal_period_hint": meal_hint,
+                "city": business.city,
+                "state": business.state,
+                "category_hint": cat_hint,
+                "support_level": support,
+                "remaining_visits_after_holdout": remaining_visits,
+                "query_goal": "real-time recommendation request from user perspective",
+            }
+            try:
+                self.calls += 1
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": json.dumps(user_payload, ensure_ascii=False),
+                        },
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=self.temperature,
+                    top_p=self.top_p,
                 )
-            row = json.loads(raw)
-            query = str(row.get("query", "")).strip()
-            if not query:
-                return None
-            # Basic leakage guard.
-            lower = query.lower()
-            if business.name and business.name.lower() in lower:
-                return None
-            return query
-        except Exception:
-            return None
+                raw = response.choices[0].message.content or "{}"
+                if isinstance(raw, list):
+                    raw = "".join(
+                        item.get("text", "") for item in raw if isinstance(item, dict)
+                    )
+                row = json.loads(raw)
+                query = str(row.get("query", "")).strip()
+                if not query:
+                    last_error = "empty_query"
+                    continue
+
+                words = query.split()
+                if len(words) < 6 or len(words) > 28:
+                    last_error = "length_out_of_range"
+                    continue
+
+                lower = query.lower()
+                if business.name and business.name.lower() in lower:
+                    last_error = "contains_business_name"
+                    continue
+                if business.business_id and business.business_id.lower() in lower:
+                    last_error = "contains_business_id"
+                    continue
+                if str(round(business.latitude, 3)) in lower or str(round(business.longitude, 3)) in lower:
+                    last_error = "contains_coordinates"
+                    continue
+
+                return query, str(profile["name"])
+            except Exception as exc:
+                last_error = f"api_error:{type(exc).__name__}"
+                continue
+
+        raise RuntimeError(
+            "Failed to generate query from cloud LLM after retries. "
+            f"last_error={last_error}"
+        )
 
 
 def load_businesses(path: Path) -> dict[str, BusinessLite]:
@@ -612,25 +715,53 @@ def main() -> None:
 
     city_index, category_index, all_business_ids = build_candidate_index(businesses)
 
-    llm_generator: LocalLLMQueryGenerator | None = None
-    if args.query_generator == "llm":
-        llm_generator = LocalLLMQueryGenerator(
-            base_url=args.llm_base_url,
-            model=args.llm_model,
-            api_key=args.llm_api_key,
-            temperature=args.llm_temperature,
-            max_calls=args.llm_max_calls,
+    llm_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    llm_api_key = (
+        os.getenv("OPENAI_API_KEY", "").strip()
+        or os.getenv("OPENAI_KEY", "").strip()
+    )
+    if not llm_api_key:
+        raise ValueError(
+            "Missing API key. Set OPENAI_API_KEY in environment or .env."
         )
+
+    llm_generator = CloudLLMQueryGenerator(
+        base_url=args.llm_base_url,
+        model=llm_model,
+        api_key=llm_api_key,
+        temperature=args.llm_temperature,
+        top_p=args.llm_top_p,
+        max_retries=args.llm_max_retries,
+        rng=rng,
+    )
 
     print("[3/7] Sampling evaluation users and building query/candidate files")
     all_users = list(latest.keys())
-    rng.shuffle(all_users)
 
     # Prefer sample-size. max-users is kept for backward compatibility.
     sample_limit = args.sample_size if args.sample_size > 0 else 0
     if sample_limit <= 0 and args.max_users > 0:
         sample_limit = args.max_users
-    selected_users = all_users[:sample_limit] if sample_limit > 0 else all_users
+    if args.balance_support:
+        selected_users, selected_support_counts, eligible_support_counts = (
+            sample_users_by_support_balance(
+                latest=latest,
+                visit_counts=visit_counts,
+                sample_limit=sample_limit,
+                rng=rng,
+            )
+        )
+    else:
+        rng.shuffle(all_users)
+        selected_users = all_users[:sample_limit] if sample_limit > 0 else all_users
+        selected_support_counts = Counter()
+        for uid in selected_users:
+            remaining = max(0, int(visit_counts.get(uid, 0)) - 1)
+            selected_support_counts[support_level_after_holdout(remaining)] += 1
+        eligible_support_counts = Counter()
+        for uid in all_users:
+            remaining = max(0, int(visit_counts.get(uid, 0)) - 1)
+            eligible_support_counts[support_level_after_holdout(remaining)] += 1
 
     selected_latest = {uid: latest[uid] for uid in selected_users}
     drop_review_lines = {
@@ -646,7 +777,7 @@ def main() -> None:
 
     query_count = 0
     llm_success = 0
-    llm_fallback = 0
+    style_counter: Counter[str] = Counter()
     with query_tmp.open("w", encoding="utf-8") as fq, candidate_tmp.open(
         "w", encoding="utf-8"
     ) as fc:
@@ -668,26 +799,21 @@ def main() -> None:
             )
 
             remaining = max(0, visit_counts[uid] - 1)
-            query_text = None
-            if llm_generator is not None:
-                query_text = llm_generator.generate(
-                    event=event,
-                    business=b,
-                    query_time=query_time,
-                    remaining_visits=remaining,
-                )
-                if query_text:
-                    llm_success += 1
-                else:
-                    llm_fallback += 1
-            if not query_text:
-                query_text = template_query(event, b, query_time, rng)
+            query_text, style_name = llm_generator.generate(
+                event=event,
+                business=b,
+                query_time=query_time,
+                remaining_visits=remaining,
+            )
+            llm_success += 1
+            style_counter[style_name] += 1
 
             query_id = f"{input_prefix}-{uid}-{event.source}-{event.line_no}"
             query_row = {
                 "query_id": query_id,
                 "user_id": uid,
                 "query_text": query_text,
+                "query_style": style_name,
                 "query_local_time": query_time.strftime("%Y-%m-%d %H:%M:%S"),
                 "query_location": {
                     "lat": round(q_lat, 6),
@@ -750,7 +876,7 @@ def main() -> None:
         drop_tip_lines=drop_tip_lines,
     )
 
-    print("[5/7] Rebuilding train-side user profiles")
+    print("[5/7] Rebuilding train-side user profiles <With sub-tasks>")
     run_profile_builder(train_output_dir, train_prefix)
 
     print("[6/7] Writing protocol metadata")
@@ -758,12 +884,16 @@ def main() -> None:
         "input_prefix": input_prefix,
         "train_prefix": train_prefix,
         "seed": args.seed,
-        "query_generator": args.query_generator,
-        "llm_base_url": args.llm_base_url if args.query_generator == "llm" else "",
-        "llm_model": args.llm_model if args.query_generator == "llm" else "",
-        "llm_temperature": args.llm_temperature if args.query_generator == "llm" else 0.0,
+        "query_generator": "cloud_llm_only",
+        "llm_base_url": args.llm_base_url,
+        "llm_model": llm_model,
+        "llm_temperature": args.llm_temperature,
+        "llm_top_p": args.llm_top_p,
+        "llm_max_retries": args.llm_max_retries,
+        "llm_api_call_count": llm_generator.calls,
         "llm_success_count": llm_success,
-        "llm_fallback_to_template_count": llm_fallback,
+        "llm_failure_count": 0,
+        "query_style_distribution": dict(style_counter),
         "candidate_size": args.candidate_size,
         "hard_negative_ratio": args.hard_negative_ratio,
         "users_with_visits": len(users_with_visits),
@@ -772,6 +902,9 @@ def main() -> None:
             "all_eligible_users": len(all_users),
             "sample_size": len(selected_users),
             "seed": args.seed,
+            "balance_support": bool(args.balance_support),
+            "support_eligible_counts": dict(eligible_support_counts),
+            "support_selected_counts": dict(selected_support_counts),
         },
         "eval_queries_count": query_count,
         "files": {
