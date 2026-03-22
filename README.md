@@ -2,6 +2,8 @@
 
 **MAVSPOI = Mixture-of-Agents Voting Scheme for context-aware query-based POI Recommendation**
 
+<img src="assets/SystemDesign.png" alt="Architecture Diagrammmm" />
+
 This repo now contains:
 - A preserved **CoMaPOI-styled baseline** (`CoMaPOI_styled/*`).
 - A modular **MAVSPOI implementation in `src/`** with:
