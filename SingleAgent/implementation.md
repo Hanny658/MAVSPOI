@@ -110,6 +110,6 @@ python -m uv run SingleAgent/run_eval.py --eval-queries data/eval/yelp-indianapo
 
 Batch eval (full corpus / max querie smoke test):
 ```bash
-python -m uv run SingleAgent/run_eval.py --eval-queries data/eval/yelp-indianapolis-eval-queries.jsonl --mode full --k-values 1,5,10 --cot-mode two_pass --max-queries 50
+python -m uv run SingleAgent/run_eval.py --eval-queries data/eval/yelp-indianapolis-eval-queries.jsonl --mode full --k-values 1,5,10 --cot-mode two_pass --max-queries 100
 ```
 

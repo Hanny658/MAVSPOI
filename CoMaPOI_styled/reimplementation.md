@@ -23,6 +23,7 @@ Core runtime dependency is reduced to:
 ### 2.1 Runtime modules
 - `CoMaPOI_styled/pipeline.py`: end-to-end orchestration
 - `CoMaPOI_styled/agents.py`: Profiler/Forecaster/Predictor logic + fallback guards
+- `CoMaPOI_styled/trajectory_tools.py`: adapted trajectory-style statistics builder for Profiler
 - `CoMaPOI_styled/prompts.py`: structured prompts (JSON schema constrained)
 - `CoMaPOI_styled/run_query_reco.py`: single-query CLI
 - `CoMaPOI_styled/run_eval.py`: batch evaluation CLI
@@ -145,6 +146,15 @@ Context enrichment:
 - long-term notes: support level, top categories, price/radius tendencies
 - short-term hints: active hours, weekend ratio, checkin tendency
 
+Adapted pipeline stages:
+1. Retrieval (`initial_candidates`)
+2. Build adapted trajectory-style profiler tools (`freq/cat/time/loc/poi`)
+3. Profiler outputs long/short pattern + hard constraints
+4. Runtime hard-constraint filtering with relaxed fallback
+5. Build short-term initial candidate set (adapted `C_C,init`) by anchor-based retrieval aggregation
+6. Forecaster refines to `C_H`, `C_C`, and `merged`
+7. Predictor final ranking with optional low-confidence out-of-set fallback (restricted to candidate universe and penalized)
+
 Two retrieval modes:
 - `full_corpus`: search all train businesses
 - `candidate_constrained`: search only inside provided candidate IDs
@@ -230,6 +240,7 @@ Metrics:
 
 Reports:
 - overall metrics
+- candidate-stage hit-rate metrics (`initial_top`, `short_term_initial`, `long_term`, `short_term`, `merged`)
 - `by_support_level` metrics (`zero_shot/few_shot/warm`) from eval query slice metadata
 
 ## 6. Current Design Limits

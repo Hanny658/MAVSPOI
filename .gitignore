@@ -214,3 +214,4 @@ coma_poi_paper*
 # misc
 .python-version
 *.bkp
+paper/

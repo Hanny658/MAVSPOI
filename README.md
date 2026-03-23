@@ -6,6 +6,7 @@
 
 This repo now contains:
 - A preserved **CoMaPOI-styled baseline** (`CoMaPOI_styled/*`).
+- A **Non-LLM Recall+Rerank baseline** (`Recall_Rerank/*`) using listwise CE reranking.
 - A modular **MAVSPOI implementation in `src/`** with:
   - Hybrid Calibration Router
   - Chain-of-thought (internal) Voting Agents A1~A7
@@ -98,45 +99,6 @@ Compatibility file for requested naming:
 
 Settings are read from `config.yaml` (`runtime` + `mavspoi` sections), with optional env override for runtime keys.
 
-Key MAVSPOI controls:
-```yaml
-mavspoi:
-  router:
-    enabled_agents: [A1, A2, A3, A4, A5, A6, A7]
-    min_agents: 3
-    max_agents: 5
-    activation_threshold: 0.45
-    fallback_agents: [A1, A3, A4, A6]
-    default_max_distance_km: 10.0
-    use_llm: true
-    llm_temperature: 0.1
-    hybrid_heuristic_base: 0.45
-    hybrid_llm_base: 0.45
-    hybrid_prior_base: 0.10
-
-  voting:
-    candidate_pool_size: 30
-    parallel_workers: 7
-    llm_enabled: true
-    llm_temperature: 0.1
-    llm_max_tokens: 1600
-    llm_candidate_limit: 30
-    llm_weight: 0.65
-    heuristic_weight: 0.35
-
-  aggregator:
-    retrieval_weight: 0.25
-    diversity_penalty: 0.04
-    weights:
-      A1: 0.16
-      A2: 0.14
-      A3: 0.20
-      A4: 0.17
-      A5: 0.09
-      A6: 0.15
-      A7: 0.09
-```
-
 Optional env var:
 - `CONFIG_YAML_PATH=...` to point to another YAML file.
 
@@ -161,7 +123,7 @@ python main.py eval --mode constrained --eval-queries data/eval/yelp-indianapoli
 
 Full mode (--max-queries for smoke tests):
 ```bash
-python main.py eval --mode full --eval-queries data/eval/yelp-indianapolis-eval-queries.jsonl --k-values 1,5,10 --max-queries 50
+python main.py eval --mode full --eval-queries data/eval/yelp-indianapolis-eval-queries.jsonl --k-values 1,5,10 --max-queries 100
 ```
 
 ## 6. Evaluation Compatibility
