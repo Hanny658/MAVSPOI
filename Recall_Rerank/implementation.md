@@ -25,11 +25,7 @@ Provide a fully non-LLM baseline with the same runtime/eval interfaces as existi
 ## Commands
 Train model:
 ```bash
-python -m uv run Recall_Rerank/train_listwise_ce.py \
-  --train-queries data/eval/yelp-indianapolis-eval-queries.jsonl \
-  --train-candidates data/eval/yelp-indianapolis-eval-candidates.jsonl \
-  --mode constrained \
-  --model-out Recall_Rerank/models/listwise_ce_model.json
+python -m uv run Recall_Rerank/train_listwise_ce.py --train-source train_side --mode constrained --max-queries 10000 --model-out Recall_Rerank/models/listwise_ce_model.json
 ```
 
 Single query:
@@ -45,11 +41,7 @@ python -m uv run Recall_Rerank/run_query_reco.py \
 
 Batch eval:
 ```bash
-python -m uv run Recall_Rerank/run_eval.py \
-  --eval-queries data/eval/yelp-indianapolis-eval-queries.jsonl \
-  --eval-candidates data/eval/yelp-indianapolis-eval-candidates.jsonl \
-  --mode constrained \
-  --k-values 1,5,10
+python -m uv run Recall_Rerank/run_eval.py --eval-queries data/eval/yelp-indianapolis-eval-queries.jsonl --eval-candidates data/eval/yelp-indianapolis-eval-candidates.jsonl --mode constrained --k-values 1,5,10 --max-queries 100
 ```
 
 ## Output Contract
@@ -61,4 +53,3 @@ The runtime output keeps the same top-level fields:
 - `intermediate` (retrieval/rerank stats)
 - `recommendations` (business + ranking_score + reason + fit_tags + retrieval_components)
 - `summary`
-
