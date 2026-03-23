@@ -326,6 +326,58 @@ class CloudLLMQueryGenerator:
             "ambiguity_instruction": "Keep constraints soft and experiential.",
         },
     ]
+    QUERY_FAMILY_RATIOS = {
+        "explicit_category": 0.15,
+        "soft_constraint": 0.35,
+        "generic_need": 0.50,
+    }
+    SOFT_HINT_MAP = {
+        "spicy": {
+            "mexican",
+            "indian",
+            "thai",
+            "korean",
+            "szechuan",
+            "cajun",
+            "hot pot",
+        },
+        "hearty_portion": {
+            "bbq",
+            "barbeque",
+            "steakhouses",
+            "burgers",
+            "pizza",
+            "sandwiches",
+            "southern",
+        },
+        "budget_friendly": {
+            "fast food",
+            "food trucks",
+            "diners",
+            "pizza",
+            "sandwiches",
+        },
+        "quick_service": {
+            "fast food",
+            "food trucks",
+            "takeout",
+            "delis",
+        },
+        "light_or_healthy": {
+            "vegan",
+            "vegetarian",
+            "salad",
+            "juice bars & smoothies",
+            "mediterranean",
+            "poke",
+        },
+        "cozy_or_chill": {
+            "cafes",
+            "coffee & tea",
+            "tea rooms",
+            "bakeries",
+        },
+    }
 
     def __init__(
         self,
@@ -336,6 +388,7 @@ class CloudLLMQueryGenerator:
         top_p: float,
         max_retries: int,
         rng: random.Random,
+        expected_queries: int | None = None,
     ) -> None:
         if not api_key.strip():
             raise ValueError(
@@ -351,6 +404,72 @@ class CloudLLMQueryGenerator:
         self.max_retries = max(1, max_retries)
         self.calls = 0
         self.rng = rng
+        self.expected_queries = (
+            max(1, int(expected_queries))
+            if expected_queries is not None and int(expected_queries) > 0
+            else None
+        )
+        self.family_counts: Counter[str] = Counter()
+        self.family_targets = self._build_family_targets(self.expected_queries)
+
+    def _build_family_targets(self, expected_queries: int | None) -> dict[str, int]:
+        if not expected_queries:
+            return {}
+        explicit = int(round(expected_queries * self.QUERY_FAMILY_RATIOS["explicit_category"]))
+        soft = int(round(expected_queries * self.QUERY_FAMILY_RATIOS["soft_constraint"]))
+        generic = max(0, expected_queries - explicit - soft)
+        return {
+            "explicit_category": explicit,
+            "soft_constraint": soft,
+            "generic_need": generic,
+        }
+
+    def _select_query_family(self) -> str:
+        if self.family_targets:
+            remaining = {
+                family: target - int(self.family_counts.get(family, 0))
+                for family, target in self.family_targets.items()
+            }
+            available = {k: v for k, v in remaining.items() if v > 0}
+            if available:
+                families = list(available.keys())
+                weights = [float(available[f]) for f in families]
+                return str(self.rng.choices(families, weights=weights, k=1)[0])
+        families = list(self.QUERY_FAMILY_RATIOS.keys())
+        weights = [float(self.QUERY_FAMILY_RATIOS[f]) for f in families]
+        return str(self.rng.choices(families, weights=weights, k=1)[0])
+
+    def _build_soft_hints(self, categories: list[str]) -> list[str]:
+        cat_lower = [str(c).strip().lower() for c in categories if str(c).strip()]
+        hints: list[str] = []
+        for hint, trigger_categories in self.SOFT_HINT_MAP.items():
+            for cat in cat_lower:
+                if cat in trigger_categories:
+                    hints.append(hint)
+                    break
+        if not hints:
+            hints = ["comfort_food", "satisfying", "good_value"]
+        self.rng.shuffle(hints)
+        return hints[:3]
+
+    def _profile_for_family(self, family: str) -> dict[str, str]:
+        pool = list(self.PROMPT_PROFILES)
+        if family == "explicit_category":
+            filtered = [
+                p for p in pool if p["name"] in {"concise_search", "conversational_request"}
+            ]
+            pool = filtered or pool
+        elif family == "soft_constraint":
+            filtered = [
+                p for p in pool if p["name"] in {"vibe_preference", "task_oriented", "decision_anxiety"}
+            ]
+            pool = filtered or pool
+        else:
+            filtered = [
+                p for p in pool if p["name"] in {"decision_anxiety", "conversational_request", "time_pressure"}
+            ]
+            pool = filtered or pool
+        return self.rng.choice(pool)
 
     def generate(
         self,
@@ -358,14 +477,67 @@ class CloudLLMQueryGenerator:
         business: BusinessLite,
         query_time: datetime,
         remaining_visits: int,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str]:
         cat_hint = category_hint(business.categories)
         support = support_level_after_holdout(remaining_visits)
         meal_hint = meal_period_from_hour(query_time.hour)
         last_error = "unknown_error"
+        family = self._select_query_family()
 
         for _ in range(self.max_retries):
-            profile = self.rng.choice(self.PROMPT_PROFILES)
+            profile = self._profile_for_family(family)
+            if family == "explicit_category":
+                family_instruction = (
+                    "Query family: explicit_category (15%).\n"
+                    "You may use ONLY the injected category hint from GT.\n"
+                    "Do not add any other GT-derived clues (city/state, popularity, ratings, specific dishes, or store traits).\n"
+                    "The query should clearly mention that category and remain short."
+                )
+                user_payload = {
+                    "query_family": family,
+                    "time_local": query_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "hour": query_time.hour,
+                    "meal_period_hint": meal_hint,
+                    "allowed_gt_field": {"category_hint": cat_hint},
+                    "query_goal": "explicit category seeking request near me",
+                }
+            elif family == "soft_constraint":
+                soft_hints = self._build_soft_hints(business.categories)
+                family_instruction = (
+                    "Query family: soft_constraint (35%).\n"
+                    "You can use GT-derived latent traits, but NEVER mention cuisine/category terms.\n"
+                    "Write soft-constraint style needs such as affordable, spicy, filling, cozy, quick, etc.\n"
+                    "Do not reveal explicit category words or business identity clues."
+                )
+                user_payload = {
+                    "query_family": family,
+                    "time_local": query_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "hour": query_time.hour,
+                    "meal_period_hint": meal_hint,
+                    "city": business.city,
+                    "state": business.state,
+                    "soft_hints_from_gt": soft_hints,
+                    "support_level": support,
+                    "remaining_visits_after_holdout": remaining_visits,
+                    "query_goal": "soft-constraint food request without explicit category",
+                }
+            else:
+                family_instruction = (
+                    "Query family: generic_need (50%).\n"
+                    "No GT information is available in this mode.\n"
+                    "Generate very generic and broad food-seeking queries (e.g., user is unsure what to eat now).\n"
+                    "Do not mention explicit cuisine/category terms."
+                )
+                user_payload = {
+                    "query_family": family,
+                    "time_local": query_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "hour": query_time.hour,
+                    "meal_period_hint": meal_hint,
+                    "support_level": support,
+                    "remaining_visits_after_holdout": remaining_visits,
+                    "query_goal": "highly generic request for food recommendation near me",
+                }
+
             system_prompt = (
                 "You generate realistic user queries for a query-based POI recommender.\n"
                 "Hard constraints:\n"
@@ -373,22 +545,12 @@ class CloudLLMQueryGenerator:
                 "- Use natural human wording, avoid rigid templates.\n"
                 "- Keep query length between 6 and 28 words.\n"
                 "- Mention near-me/location context naturally.\n"
-                "- Output JSON only: {\"query\": \"...\", \"style\": \"...\"}.\n"
+                "- Output JSON only: {\"query\": \"...\", \"style\": \"...\", \"family\": \"...\"}.\n"
+                f"{family_instruction}\n"
                 f"Style profile: {profile['name']}\n"
                 f"Style instruction: {profile['style_instruction']}\n"
                 f"Ambiguity instruction: {profile['ambiguity_instruction']}\n"
             )
-            user_payload = {
-                "time_local": query_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "hour": query_time.hour,
-                "meal_period_hint": meal_hint,
-                "city": business.city,
-                "state": business.state,
-                "category_hint": cat_hint,
-                "support_level": support,
-                "remaining_visits_after_holdout": remaining_visits,
-                "query_goal": "real-time recommendation request from user perspective",
-            }
             try:
                 self.calls += 1
                 response = self.client.chat.completions.create(
@@ -415,23 +577,10 @@ class CloudLLMQueryGenerator:
                     last_error = "empty_query"
                     continue
 
-                words = query.split()
-                if len(words) < 6 or len(words) > 28:
-                    last_error = "length_out_of_range"
-                    continue
-
-                lower = query.lower()
-                if business.name and business.name.lower() in lower:
-                    last_error = "contains_business_name"
-                    continue
-                if business.business_id and business.business_id.lower() in lower:
-                    last_error = "contains_business_id"
-                    continue
-                if str(round(business.latitude, 3)) in lower or str(round(business.longitude, 3)) in lower:
-                    last_error = "contains_coordinates"
-                    continue
-
-                return query, str(profile["name"])
+                self.family_counts[family] += 1
+                style_name = str(row.get("style", "")).strip() or str(profile["name"])
+                style_key = f"{family}:{style_name}"
+                return query, style_key, family
             except Exception as exc:
                 last_error = f"api_error:{type(exc).__name__}"
                 continue
@@ -725,16 +874,6 @@ def main() -> None:
             "Missing API key. Set OPENAI_API_KEY in environment or .env."
         )
 
-    llm_generator = CloudLLMQueryGenerator(
-        base_url=args.llm_base_url,
-        model=llm_model,
-        api_key=llm_api_key,
-        temperature=args.llm_temperature,
-        top_p=args.llm_top_p,
-        max_retries=args.llm_max_retries,
-        rng=rng,
-    )
-
     print("[3/7] Sampling evaluation users and building query/candidate files")
     all_users = list(latest.keys())
 
@@ -775,9 +914,21 @@ def main() -> None:
         if event.source == "tip"
     }
 
+    llm_generator = CloudLLMQueryGenerator(
+        base_url=args.llm_base_url,
+        model=llm_model,
+        api_key=llm_api_key,
+        temperature=args.llm_temperature,
+        top_p=args.llm_top_p,
+        max_retries=args.llm_max_retries,
+        rng=rng,
+        expected_queries=len(selected_users),
+    )
+
     query_count = 0
     llm_success = 0
     style_counter: Counter[str] = Counter()
+    family_counter: Counter[str] = Counter()
     with query_tmp.open("w", encoding="utf-8") as fq, candidate_tmp.open(
         "w", encoding="utf-8"
     ) as fc:
@@ -799,7 +950,7 @@ def main() -> None:
             )
 
             remaining = max(0, visit_counts[uid] - 1)
-            query_text, style_name = llm_generator.generate(
+            query_text, style_name, family_name = llm_generator.generate(
                 event=event,
                 business=b,
                 query_time=query_time,
@@ -807,6 +958,7 @@ def main() -> None:
             )
             llm_success += 1
             style_counter[style_name] += 1
+            family_counter[family_name] += 1
 
             query_id = f"{input_prefix}-{uid}-{event.source}-{event.line_no}"
             query_row = {
@@ -814,6 +966,7 @@ def main() -> None:
                 "user_id": uid,
                 "query_text": query_text,
                 "query_style": style_name,
+                "query_family": family_name,
                 "query_local_time": query_time.strftime("%Y-%m-%d %H:%M:%S"),
                 "query_location": {
                     "lat": round(q_lat, 6),
@@ -894,6 +1047,8 @@ def main() -> None:
         "llm_success_count": llm_success,
         "llm_failure_count": 0,
         "query_style_distribution": dict(style_counter),
+        "query_family_distribution": dict(family_counter),
+        "query_family_target_distribution": dict(llm_generator.family_targets),
         "candidate_size": args.candidate_size,
         "hard_negative_ratio": args.hard_negative_ratio,
         "users_with_visits": len(users_with_visits),
