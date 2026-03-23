@@ -58,11 +58,13 @@ class ProfilerAgent:
         context: UserQueryContext,
         initial_candidates: list[CandidateScore],
         profile_features: dict[str, Any] | None = None,
+        profiler_tools: dict[str, Any] | None = None,
     ) -> ProfilerOutput:
         payload = {
             "task": "query_based_real_time_poi_recommendation",
             "context": context.to_dict(),
             "user_profile_features": profile_features or {},
+            "trajectory_tools": profiler_tools or {},
             "retrieval_snapshot": [
                 c.to_compact_dict() for c in initial_candidates[:15]
             ],
@@ -119,10 +121,12 @@ class ForecasterAgent:
         context: UserQueryContext,
         profiler_output: ProfilerOutput,
         initial_candidates: list[CandidateScore],
+        short_term_initial_candidate_ids: list[str] | None = None,
         top_k: int = 25,
         profile_features: dict[str, Any] | None = None,
     ) -> ForecasterOutput:
         allowed_ids = {c.business.business_id for c in initial_candidates}
+        short_term_initial_candidate_ids = short_term_initial_candidate_ids or []
         payload = {
             "context": context.to_dict(),
             "user_profile_features": profile_features or {},
@@ -132,6 +136,9 @@ class ForecasterAgent:
                 "hard_constraints": profiler_output.hard_constraints,
             },
             "initial_candidates": [c.to_compact_dict() for c in initial_candidates],
+            "short_term_initial_candidate_ids": [
+                x for x in short_term_initial_candidate_ids if x in allowed_ids
+            ][: max(10, top_k * 2)],
             "target_size_each_list": top_k,
         }
         try:
@@ -156,7 +163,14 @@ class ForecasterAgent:
         if not long_ids:
             long_ids = [c.business.business_id for c in initial_candidates[:top_k]]
         if not short_ids:
-            short_ids = [c.business.business_id for c in initial_candidates[:top_k]]
+            if short_term_initial_candidate_ids:
+                short_ids = _sanitize_ids(
+                    short_term_initial_candidate_ids,
+                    allowed_ids,
+                    top_k,
+                )
+            else:
+                short_ids = [c.business.business_id for c in initial_candidates[:top_k]]
         if not merged_ids:
             merged_ids = _dedup_keep_order(long_ids + short_ids)[:top_k]
 
@@ -183,10 +197,15 @@ class PredictorAgent:
         profiler_output: ProfilerOutput,
         forecaster_output: ForecasterOutput,
         final_candidates: list[CandidateScore],
+        candidate_universe: list[CandidateScore] | None = None,
         top_k: int = 10,
         profile_features: dict[str, Any] | None = None,
+        allow_out_of_set: bool = True,
+        out_of_set_penalty: float = 0.85,
     ) -> PredictorOutput:
         allowed_ids = {c.business.business_id for c in final_candidates}
+        candidate_universe = candidate_universe or final_candidates
+        universe_ids = {c.business.business_id for c in candidate_universe}
         payload = {
             "context": context.to_dict(),
             "user_profile_features": profile_features or {},
@@ -200,6 +219,8 @@ class PredictorAgent:
                 "merged_candidate_ids": forecaster_output.merged_candidate_ids,
             },
             "final_candidates": [c.to_compact_dict() for c in final_candidates],
+            "candidate_universe": [c.to_compact_dict() for c in candidate_universe[:60]],
+            "allow_out_of_set": bool(allow_out_of_set),
             "top_k": top_k,
         }
         try:
@@ -216,16 +237,33 @@ class PredictorAgent:
             recs = []
 
         sanitized_recs: list[dict[str, Any]] = []
+        out_of_set_count = 0
+        seen: set[str] = set()
         for row in recs:
             if not isinstance(row, dict):
                 continue
             business_id = str(row.get("business_id", "")).strip()
-            if business_id not in allowed_ids:
+            is_out_of_set = business_id not in allowed_ids
+            if is_out_of_set and (
+                not allow_out_of_set
+                or business_id not in universe_ids
+                or out_of_set_count >= 2
+            ):
                 continue
-            score = float(row.get("score", 0.5))
+            if business_id in seen:
+                continue
+            try:
+                score = float(row.get("score", 0.5))
+            except (TypeError, ValueError):
+                score = 0.5
+            if is_out_of_set:
+                score = score * max(0.0, min(1.0, out_of_set_penalty))
+                out_of_set_count += 1
             reason = str(row.get("reason", "")).strip()
             fit_tags_raw = row.get("fit_tags", [])
             fit_tags = [str(x) for x in fit_tags_raw] if isinstance(fit_tags_raw, list) else []
+            if is_out_of_set:
+                fit_tags.append("out_of_set_candidate")
             sanitized_recs.append(
                 {
                     "business_id": business_id,
@@ -234,6 +272,7 @@ class PredictorAgent:
                     "fit_tags": fit_tags[:6],
                 }
             )
+            seen.add(business_id)
             if len(sanitized_recs) >= top_k:
                 break
 

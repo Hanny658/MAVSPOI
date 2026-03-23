@@ -7,6 +7,8 @@ What is preserved from CoMaPOI:
 - 3-agent decomposition: `Profiler -> Forecaster -> Predictor`
 - Two-layer preference modeling idea: long-term + short-term
 - Candidate refinement before final ranking
+- Adapted trajectory-style tool summaries (`freq/cat/time/loc/poi`) for Profiler prompts
+- Candidate-stage observability (`initial/CH/CC/merged` hit-rate in eval output)
 
 What is intentionally changed:
 - No trajectory prediction objective
@@ -181,6 +183,7 @@ All agents:
 
 Profiler:
 - Input: context + compact profile + retrieval snapshot
+- Input also includes adapted tool summaries approximating trajectory statistics
 - Output:
 - `long_term_profile`
 - `short_term_pattern`
@@ -188,6 +191,7 @@ Profiler:
 
 Forecaster:
 - Input: context + profiler output + initial candidates
+- Input also includes `short_term_initial_candidate_ids` (adapted `C_C,init`)
 - Output:
 - `long_term_candidate_ids` (`C_H`)
 - `short_term_candidate_ids` (`C_C`)
@@ -197,10 +201,11 @@ Forecaster:
 
 Predictor:
 - Input: context + profiler output + forecaster output + final candidate list
+- Input also includes a broader candidate universe for optional out-of-set fallback
 - Output:
 - final ordered recommendations (`business_id`, `score`, `reason`, `fit_tags`)
 - `final_summary`
-- Safety: keeps only allowed candidate IDs, score clipped to `[0,1]`.
+- Safety: keeps IDs in allowed set by default; optional low-confidence out-of-set fallback is constrained to candidate universe and penalized.
 
 Prompting strategy:
 - `CoMaPOI_styled/prompts.py` defines strict JSON schema contracts for each agent.
@@ -228,8 +233,8 @@ Reports:
 - `by_support_level` metrics (`zero_shot/few_shot/warm`) from eval query slice metadata
 
 ## 6. Current Design Limits
-- `hard_constraints` from Profiler are not yet strict hard filters in retriever.
-- Open-hour constraints are represented in prompts but not strictly enforced by a runtime business-hour engine.
+- `hard_constraints` are now applied with runtime filtering and a relaxed fallback when filtering is over-aggressive.
+- Open-hour and distance constraints are still lightweight and do not use a full business-hour engine from raw hour ranges.
 - In full mode, performance may look high on smaller/easier sampled subsets; use larger samples and harder candidates for robust comparison.
 
 ## 7. Reproducible Command Sequence (uv)

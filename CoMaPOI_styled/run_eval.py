@@ -161,6 +161,30 @@ def _agg_finalize(agg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _stage_hit_update(
+    stage_agg: dict[str, Any],
+    stage_ids: dict[str, Any],
+    gt_id: str,
+) -> None:
+    stage_agg["count"] += 1
+    for key in stage_agg["stages"].keys():
+        raw = stage_ids.get(key, [])
+        ids = [str(x).strip() for x in raw] if isinstance(raw, list) else []
+        if gt_id in ids:
+            stage_agg["stages"][key] += 1
+
+
+def _stage_hit_finalize(stage_agg: dict[str, Any]) -> dict[str, Any]:
+    count = max(1, int(stage_agg.get("count", 0)))
+    return {
+        "count": int(stage_agg.get("count", 0)),
+        "stage_hit_rate": {
+            k: round(float(v) / count, 6)
+            for k, v in stage_agg.get("stages", {}).items()
+        },
+    }
+
+
 def _estimate_eval_total(path: Path, max_queries: int) -> int:
     total = 0
     for row in _iter_jsonl(path):
@@ -215,6 +239,16 @@ def main() -> None:
 
     global_agg = _agg_init(ks)
     by_support: dict[str, dict[str, Any]] = defaultdict(lambda: _agg_init(ks))
+    stage_agg = {
+        "count": 0,
+        "stages": {
+            "initial_top": 0,
+            "short_term_initial": 0,
+            "long_term": 0,
+            "short_term": 0,
+            "merged": 0,
+        },
+    }
     pred_writer = None
     if args.save_predictions.strip():
         pred_path = Path(args.save_predictions.strip())
@@ -258,6 +292,13 @@ def main() -> None:
 
         _agg_update(global_agg, ranked_ids, gt_id, ks)
         _agg_update(by_support[support], ranked_ids, gt_id, ks)
+        stage_ids = (
+            ((result.get("intermediate") or {}).get("candidate_stage_ids", {}))
+            if isinstance(result, dict)
+            else {}
+        )
+        if isinstance(stage_ids, dict):
+            _stage_hit_update(stage_agg, stage_ids, gt_id)
 
         if pred_writer:
             pred_writer.write(
@@ -293,6 +334,7 @@ def main() -> None:
         "processed_queries": processed,
         "k_values": ks,
         "overall": _agg_finalize(global_agg),
+        "candidate_stage_hit": _stage_hit_finalize(stage_agg),
         "by_support_level": {
             support: _agg_finalize(agg) for support, agg in sorted(by_support.items())
         },

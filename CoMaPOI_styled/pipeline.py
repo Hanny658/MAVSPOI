@@ -11,6 +11,7 @@ from CoMaPOI_styled.agents import (
     ProfilerAgent,
     ProfilerOutput,
 )
+from CoMaPOI_styled.trajectory_tools import build_profiler_tools
 from src.config import Settings
 from src.openai_client import OpenAIService
 from src.profile_loader import load_user_profiles
@@ -123,6 +124,24 @@ def _merge_notes(manual_note: str, profile_note: str) -> str:
     return manual_note or profile_note
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    return default
+
+
 class CoMaPOIStyledRealtimeRecommender:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -141,6 +160,115 @@ class CoMaPOIStyledRealtimeRecommender:
         self.profiler = ProfilerAgent(self.openai_service)
         self.forecaster = ForecasterAgent(self.openai_service)
         self.predictor = PredictorAgent(self.openai_service)
+
+    def _apply_hard_constraints(
+        self,
+        candidates: list[CandidateScore],
+        constraints: dict[str, Any],
+        top_k: int,
+    ) -> tuple[list[CandidateScore], dict[str, Any]]:
+        city = str(constraints.get("city", "")).strip().lower()
+        state = str(constraints.get("state", "")).strip().lower()
+        open_now = _safe_bool(constraints.get("open_now", False), False)
+        max_distance_km = _safe_float(constraints.get("max_distance_km", 0.0), 0.0)
+
+        kept: list[CandidateScore] = []
+        rejected_city = 0
+        rejected_state = 0
+        rejected_open = 0
+        rejected_distance = 0
+        for candidate in candidates:
+            poi = candidate.business
+            if city and poi.city.strip().lower() != city:
+                rejected_city += 1
+                continue
+            if state and poi.state.strip().lower() != state:
+                rejected_state += 1
+                continue
+            if open_now and int(poi.is_open) != 1:
+                rejected_open += 1
+                continue
+            if (
+                max_distance_km > 0
+                and candidate.distance_km is not None
+                and float(candidate.distance_km) > max_distance_km
+            ):
+                rejected_distance += 1
+                continue
+            kept.append(candidate)
+
+        min_keep = max(5, top_k)
+        relaxed = False
+        if len(kept) < min_keep:
+            kept = candidates[: max(min_keep, min(len(candidates), self.settings.forecaster_top_k))]
+            relaxed = True
+
+        stats = {
+            "enabled_constraints": {
+                "city": city,
+                "state": state,
+                "open_now": open_now,
+                "max_distance_km": max_distance_km,
+            },
+            "rejected_city": rejected_city,
+            "rejected_state": rejected_state,
+            "rejected_open": rejected_open,
+            "rejected_distance": rejected_distance,
+            "relaxed_fallback": relaxed,
+            "post_constraint_size": len(kept),
+        }
+        return kept, stats
+
+    def _build_short_term_initial_candidates(
+        self,
+        context: UserQueryContext,
+        candidates: list[CandidateScore],
+        candidate_business_ids: list[str] | None,
+        top_k: int,
+    ) -> list[str]:
+        if not candidates:
+            return []
+        anchors = candidates[: min(3, len(candidates))]
+        seed: list[str] = [c.business.business_id for c in anchors]
+        for anchor in anchors:
+            anchor_query = (
+                f"{context.query_text}. "
+                f"Recent mobility anchor: {anchor.business.name}. "
+                f"Categories: {', '.join(anchor.business.categories[:4])}."
+            )
+            anchor_context = UserQueryContext(
+                query_text=anchor_query,
+                local_time=context.local_time,
+                location=context.location,
+                city=context.city,
+                state=context.state,
+                user_id=context.user_id,
+                long_term_notes=context.long_term_notes,
+                recent_activity_notes=context.recent_activity_notes,
+            )
+            if candidate_business_ids:
+                retrieved = self.retriever.retrieve_from_pool(
+                    context=anchor_context,
+                    candidate_business_ids=candidate_business_ids,
+                    top_k=top_k,
+                )
+            else:
+                retrieved = self.retriever.retrieve(
+                    context=anchor_context,
+                    top_k=top_k,
+                )
+            seed.extend(c.business.business_id for c in retrieved)
+
+        seen: set[str] = set()
+        out: list[str] = []
+        for bid in seed:
+            if bid in seen:
+                continue
+            seen.add(bid)
+            out.append(bid)
+            if len(out) >= max(top_k * 2, 30):
+                break
+        return out
 
     def _slice_final_candidates(
         self,
@@ -212,33 +340,53 @@ class CoMaPOIStyledRealtimeRecommender:
                 top_k=self.settings.retrieval_top_k,
             )
             retrieval_mode = "full_corpus"
+        profiler_tools = build_profiler_tools(
+            context=enriched_context,
+            profile_features=profile_features,
+            initial_candidates=initial_candidates,
+        )
         profiler_output: ProfilerOutput = self.profiler.run(
             enriched_context,
             initial_candidates,
             profile_features=profile_features,
+            profiler_tools=profiler_tools,
+        )
+        constrained_candidates, constraint_stats = self._apply_hard_constraints(
+            candidates=initial_candidates,
+            constraints=profiler_output.hard_constraints,
+            top_k=top_k,
+        )
+        short_term_initial_ids = self._build_short_term_initial_candidates(
+            context=enriched_context,
+            candidates=constrained_candidates,
+            candidate_business_ids=candidate_business_ids,
+            top_k=self.settings.forecaster_top_k,
         )
         forecaster_output: ForecasterOutput = self.forecaster.run(
             context=enriched_context,
             profiler_output=profiler_output,
-            initial_candidates=initial_candidates,
+            initial_candidates=constrained_candidates,
+            short_term_initial_candidate_ids=short_term_initial_ids,
             top_k=self.settings.forecaster_top_k,
             profile_features=profile_features,
         )
-        final_candidates = self._slice_final_candidates(initial_candidates, forecaster_output)
+        final_candidates = self._slice_final_candidates(constrained_candidates, forecaster_output)
         predictor_output: PredictorOutput = self.predictor.run(
             context=enriched_context,
             profiler_output=profiler_output,
             forecaster_output=forecaster_output,
             final_candidates=final_candidates,
+            candidate_universe=constrained_candidates,
             top_k=top_k,
             profile_features=profile_features,
+            allow_out_of_set=True,
         )
 
-        final_by_id = {c.business.business_id: c for c in final_candidates}
+        universe_by_id = {c.business.business_id: c for c in constrained_candidates}
         recommendations: list[dict[str, Any]] = []
         for row in predictor_output.recommendations:
             business_id = row["business_id"]
-            candidate = final_by_id.get(business_id)
+            candidate = universe_by_id.get(business_id)
             if candidate is None:
                 continue
             merged = {
@@ -263,6 +411,24 @@ class CoMaPOIStyledRealtimeRecommender:
             "retrieval_mode": retrieval_mode,
             "user_profile_features": profile_features,
             "intermediate": {
+                "candidate_stage_sizes": {
+                    "initial": len(initial_candidates),
+                    "post_constraints": len(constrained_candidates),
+                    "short_term_initial": len(short_term_initial_ids),
+                    "long_term": len(forecaster_output.long_term_candidate_ids),
+                    "short_term": len(forecaster_output.short_term_candidate_ids),
+                    "merged": len(forecaster_output.merged_candidate_ids),
+                    "final_candidates": len(final_candidates),
+                },
+                "candidate_stage_ids": {
+                    "initial_top": [c.business.business_id for c in initial_candidates[:50]],
+                    "short_term_initial": short_term_initial_ids[:50],
+                    "long_term": forecaster_output.long_term_candidate_ids[:50],
+                    "short_term": forecaster_output.short_term_candidate_ids[:50],
+                    "merged": forecaster_output.merged_candidate_ids[:50],
+                },
+                "constraint_stats": constraint_stats,
+                "profiler_tools": profiler_tools,
                 "profiler_output": asdict(profiler_output),
                 "forecaster_output": asdict(forecaster_output),
             },
