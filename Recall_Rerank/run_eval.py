@@ -97,16 +97,47 @@ def _dcg_from_rank(rank_1based: int) -> float:
     return 1.0 / math.log2(rank_1based + 1.0)
 
 
-def _metric_at_k(ranked_ids: list[str], gt_id: str, k: int) -> dict[str, float]:
+def _dcg_from_gain(relevance: float, rank_1based: int) -> float:
+    import math
+
+    rel = max(0.0, float(relevance))
+    return (2.0**rel - 1.0) / math.log2(rank_1based + 1.0)
+
+
+def _extract_soft_targets(row: dict[str, Any]) -> dict[str, float]:
+    mapping: dict[str, float] = {}
+    soft = row.get("ground_truth_soft")
+    if isinstance(soft, dict):
+        items = soft.get("items", [])
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                bid = str(item.get("business_id", "")).strip()
+                if not bid:
+                    continue
+                try:
+                    rel = float(item.get("relevance", 0.0))
+                except Exception:
+                    continue
+                if rel <= 0.0:
+                    continue
+                mapping[bid] = max(mapping.get(bid, 0.0), rel)
+    gt_id = str((row.get("ground_truth") or {}).get("business_id", "")).strip()
+    if gt_id and gt_id not in mapping:
+        mapping[gt_id] = 1.0
+    return mapping
+
+
+def _hard_metric_at_k(ranked_ids: list[str], gt_id: str, k: int) -> dict[str, float]:
     topk = ranked_ids[:k]
     if gt_id not in topk:
-        return {"hit": 0.0, "recall": 0.0, "ndcg": 0.0, "mrr": 0.0}
+        return {"hit": 0.0, "recall": 0.0, "ndcg": 0.0}
     rank = topk.index(gt_id) + 1
     return {
         "hit": 1.0,
         "recall": 1.0,
         "ndcg": _dcg_from_rank(rank),
-        "mrr": 1.0 / rank,
     }
 
 
@@ -136,20 +167,63 @@ def _agg_init(ks: list[int]) -> dict[str, Any]:
     return {
         "count": 0,
         "metrics": {
-            str(k): {"hit": 0.0, "recall": 0.0, "ndcg": 0.0, "mrr": 0.0} for k in ks
+            str(k): {
+                "hit": 0.0,
+                "recall": 0.0,
+                "ndcg": 0.0,
+                "ndcg_soft": 0.0,
+                "wrecall_soft": 0.0,
+            }
+            for k in ks
         },
     }
 
 
-def _agg_update(agg: dict[str, Any], ranked_ids: list[str], gt_id: str, ks: list[int]) -> None:
+def _soft_metric_at_k(
+    ranked_ids: list[str],
+    soft_targets: dict[str, float],
+    k: int,
+) -> dict[str, float]:
+    if not soft_targets:
+        return {"ndcg_soft": 0.0, "wrecall_soft": 0.0}
+    topk = ranked_ids[:k]
+    dcg = 0.0
+    seen: set[str] = set()
+    covered_rel = 0.0
+    for idx, bid in enumerate(topk, start=1):
+        rel = float(soft_targets.get(bid, 0.0))
+        if rel <= 0.0:
+            continue
+        dcg += _dcg_from_gain(rel, idx)
+        if bid not in seen:
+            covered_rel += rel
+            seen.add(bid)
+    ideal_rels = sorted((float(v) for v in soft_targets.values() if v > 0.0), reverse=True)[:k]
+    idcg = sum(_dcg_from_gain(rel, idx) for idx, rel in enumerate(ideal_rels, start=1))
+    total_rel = sum(float(v) for v in soft_targets.values() if v > 0.0)
+    return {
+        "ndcg_soft": (dcg / idcg) if idcg > 1e-12 else 0.0,
+        "wrecall_soft": (covered_rel / total_rel) if total_rel > 1e-12 else 0.0,
+    }
+
+
+def _agg_update(
+    agg: dict[str, Any],
+    ranked_ids: list[str],
+    gt_id: str,
+    soft_targets: dict[str, float],
+    ks: list[int],
+) -> None:
     agg["count"] += 1
     for k in ks:
-        mk = _metric_at_k(ranked_ids, gt_id, k)
+        mk = _hard_metric_at_k(ranked_ids, gt_id, k)
+        sk = _soft_metric_at_k(ranked_ids, soft_targets, k)
         bucket = agg["metrics"][str(k)]
         bucket["hit"] += mk["hit"]
         bucket["recall"] += mk["recall"]
         bucket["ndcg"] += mk["ndcg"]
-        bucket["mrr"] += mk["mrr"]
+        bucket["ndcg_soft"] += sk["ndcg_soft"]
+        bucket["wrecall_soft"] += sk["wrecall_soft"]
 
 
 def _agg_finalize(agg: dict[str, Any]) -> dict[str, Any]:
@@ -160,7 +234,8 @@ def _agg_finalize(agg: dict[str, Any]) -> dict[str, Any]:
             "hit": round(bucket["hit"] / count, 6),
             "recall": round(bucket["recall"] / count, 6),
             "ndcg": round(bucket["ndcg"] / count, 6),
-            "mrr": round(bucket["mrr"] / count, 6),
+            "ndcg_soft": round(bucket["ndcg_soft"] / count, 6),
+            "wrecall_soft": round(bucket["wrecall_soft"] / count, 6),
         }
     return out
 
@@ -169,8 +244,8 @@ def _estimate_eval_total(path: Path, max_queries: int) -> int:
     total = 0
     for row in _iter_jsonl(path):
         query_id = str(row.get("query_id", "")).strip()
-        gt_id = str((row.get("ground_truth") or {}).get("business_id", "")).strip()
-        if not query_id or not gt_id:
+        soft_targets = _extract_soft_targets(row)
+        if not query_id or not soft_targets:
             continue
         total += 1
         if max_queries > 0 and total >= max_queries:
@@ -235,9 +310,10 @@ def main() -> None:
     processed = 0
     for row in _iter_jsonl(eval_queries_path):
         query_id = str(row.get("query_id", "")).strip()
+        soft_targets = _extract_soft_targets(row)
         gt = row.get("ground_truth") or {}
         gt_id = str(gt.get("business_id", "")).strip()
-        if not query_id or not gt_id:
+        if not query_id or not soft_targets or not gt_id:
             continue
 
         context = _to_context(row)
@@ -257,8 +333,8 @@ def main() -> None:
             if str(item.get("business", {}).get("business_id", "")).strip()
         ]
         support = str((row.get("evaluation_slice") or {}).get("support_level_after_holdout", "unknown"))
-        _agg_update(global_agg, ranked_ids, gt_id, ks)
-        _agg_update(by_support[support], ranked_ids, gt_id, ks)
+        _agg_update(global_agg, ranked_ids, gt_id, soft_targets, ks)
+        _agg_update(by_support[support], ranked_ids, gt_id, soft_targets, ks)
 
         if pred_writer:
             pred_writer.write(
@@ -302,4 +378,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

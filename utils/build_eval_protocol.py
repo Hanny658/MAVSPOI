@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -35,6 +36,8 @@ class BusinessLite:
     latitude: float
     longitude: float
     categories: list[str]
+    stars: float
+    review_count: int
 
 
 @dataclass
@@ -100,6 +103,25 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Ratio of hard negatives from same city/category (default: 0.5).",
+    )
+    parser.add_argument(
+        "--soft-gt-scope",
+        choices=["candidate", "full"],
+        default="full",
+        help=(
+            "Scope used to build ground_truth_soft. "
+            "'candidate' uses only constrained candidates; "
+            "'full' builds soft labels from full corpus (default: full)."
+        ),
+    )
+    parser.add_argument(
+        "--soft-gt-full-max-businesses",
+        type=int,
+        default=0,
+        help=(
+            "Optional cap for full-scope soft GT pool size. "
+            "0 means all businesses in corpus."
+        ),
     )
     parser.add_argument(
         "--balance-support",
@@ -279,6 +301,347 @@ def meal_period_from_hour(hour: int) -> str:
     if 17 <= hour <= 21:
         return "dinner"
     return "late-night"
+
+
+SOFT_GT_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "any",
+    "are",
+    "at",
+    "be",
+    "best",
+    "by",
+    "do",
+    "for",
+    "food",
+    "get",
+    "good",
+    "i",
+    "im",
+    "in",
+    "is",
+    "it",
+    "just",
+    "me",
+    "my",
+    "near",
+    "nearby",
+    "of",
+    "on",
+    "or",
+    "place",
+    "please",
+    "recommend",
+    "restaurant",
+    "restaurants",
+    "some",
+    "something",
+    "that",
+    "the",
+    "to",
+    "want",
+    "with",
+}
+
+SOFT_GT_CONSTRAINT_KEYWORDS = {
+    "budget": {
+        "cheap",
+        "affordable",
+        "budget",
+        "inexpensive",
+        "low cost",
+        "value",
+        "not pricey",
+    },
+    "spicy": {"spicy", "hot"},
+    "quick": {"quick", "fast", "hurry", "takeout", "grab"},
+    "healthy": {"healthy", "light", "clean", "fresh"},
+    "cozy": {"cozy", "quiet", "chill", "relax", "casual"},
+    "hearty": {"filling", "hearty", "big portion", "large portion", "substantial"},
+    "dessert": {"dessert", "sweet", "cake", "ice cream"},
+    "caffeine": {"coffee", "tea", "cafe"},
+    "highly_rated": {"top rated", "high rated", "highly rated", "best", "popular"},
+    "nearby": {"near", "nearby", "close", "walk", "walking"},
+}
+
+SOFT_GT_CONSTRAINT_CATEGORY_HINTS = {
+    "budget": {"fast food", "food trucks", "diners", "pizza", "sandwiches"},
+    "spicy": {"mexican", "indian", "thai", "szechuan", "cajun", "hot pot"},
+    "quick": {"fast food", "takeout", "delis", "food trucks"},
+    "healthy": {
+        "vegan",
+        "vegetarian",
+        "salad",
+        "juice bars & smoothies",
+        "mediterranean",
+        "poke",
+    },
+    "cozy": {"cafes", "coffee & tea", "tea rooms", "bakeries"},
+    "hearty": {"bbq", "barbeque", "steakhouses", "burgers", "pizza", "sandwiches"},
+    "dessert": {"desserts", "ice cream", "bakeries", "donuts"},
+    "caffeine": {"cafes", "coffee & tea", "tea rooms"},
+}
+
+SOFT_GT_FAMILY_CONFIG = {
+    "explicit_category": {
+        "weights": {
+            "intent": 0.45,
+            "substitutability": 0.30,
+            "constraint": 0.20,
+            "exposure": 0.05,
+        },
+        "min_relevance": 0.20,
+        "max_items": 15,
+    },
+    "soft_constraint": {
+        "weights": {
+            "intent": 0.30,
+            "substitutability": 0.25,
+            "constraint": 0.35,
+            "exposure": 0.10,
+        },
+        "min_relevance": 0.18,
+        "max_items": 20,
+    },
+    "generic_need": {
+        "weights": {
+            "intent": 0.15,
+            "substitutability": 0.40,
+            "constraint": 0.15,
+            "exposure": 0.30,
+        },
+        "min_relevance": 0.12,
+        "max_items": 25,
+    },
+}
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def _tokenize_text(text: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9]+", str(text).lower())
+    return [
+        tok
+        for tok in tokens
+        if tok and tok not in SOFT_GT_STOPWORDS and len(tok) > 1
+    ]
+
+
+def _category_token_set(categories: list[str]) -> set[str]:
+    terms: set[str] = set()
+    for raw in categories:
+        cat = str(raw).strip().lower()
+        if not cat:
+            continue
+        terms.add(cat)
+        for part in re.findall(r"[a-z0-9]+", cat):
+            if part and part not in SOFT_GT_STOPWORDS:
+                terms.add(part)
+    return terms
+
+
+def _business_token_set(business: BusinessLite) -> set[str]:
+    tokens = set(_tokenize_text(business.name))
+    tokens |= _category_token_set(business.categories)
+    return tokens
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius_km = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2
+    return 2.0 * radius_km * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1.0 - a)))
+
+
+def _detect_query_constraints(query_text: str) -> list[str]:
+    q = str(query_text).strip().lower()
+    signals: list[str] = []
+    for name, keywords in SOFT_GT_CONSTRAINT_KEYWORDS.items():
+        if any(kw in q for kw in keywords):
+            signals.append(name)
+    return signals
+
+
+def _intent_consistency_score(query_text: str, business: BusinessLite) -> float:
+    q_tokens = set(_tokenize_text(query_text))
+    if not q_tokens:
+        return 0.5
+    b_tokens = _business_token_set(business)
+    overlap = len(q_tokens & b_tokens)
+    lexical = overlap / max(1, min(8, len(q_tokens)))
+    category_overlap = len(q_tokens & _category_token_set(business.categories))
+    category_boost = 1.0 if category_overlap > 0 else 0.0
+    return _clamp01(0.15 + 0.55 * lexical + 0.30 * category_boost)
+
+
+def _substitutability_score(anchor: BusinessLite, candidate: BusinessLite) -> float:
+    if candidate.business_id == anchor.business_id:
+        return 1.0
+
+    a_cats = _category_token_set(anchor.categories)
+    c_cats = _category_token_set(candidate.categories)
+    if not a_cats and not c_cats:
+        cat_sim = 0.5
+    else:
+        inter = len(a_cats & c_cats)
+        union = max(1, len(a_cats | c_cats))
+        cat_sim = inter / union
+
+    if (
+        abs(anchor.latitude) > 1e-9
+        or abs(anchor.longitude) > 1e-9
+        or abs(candidate.latitude) > 1e-9
+        or abs(candidate.longitude) > 1e-9
+    ):
+        d_km = _haversine_km(
+            anchor.latitude,
+            anchor.longitude,
+            candidate.latitude,
+            candidate.longitude,
+        )
+        geo_sim = math.exp(-d_km / 5.0)
+    else:
+        geo_sim = 0.5
+
+    star_sim = 1.0 - min(1.0, abs(float(anchor.stars) - float(candidate.stars)) / 5.0)
+    return _clamp01(0.65 * cat_sim + 0.25 * geo_sim + 0.10 * star_sim)
+
+
+def _constraint_match_score(
+    query_constraints: list[str],
+    candidate: BusinessLite,
+    query_lat: float | None,
+    query_lon: float | None,
+) -> float:
+    if not query_constraints:
+        return 0.5
+
+    cat_terms = _category_token_set(candidate.categories)
+    scores: list[float] = []
+    for cons in query_constraints:
+        if cons == "nearby":
+            if query_lat is None or query_lon is None:
+                scores.append(0.5)
+                continue
+            d_km = _haversine_km(query_lat, query_lon, candidate.latitude, candidate.longitude)
+            scores.append(_clamp01(math.exp(-d_km / 3.0)))
+            continue
+
+        if cons == "highly_rated":
+            stars_norm = _clamp01(float(candidate.stars) / 5.0)
+            reviews_norm = _clamp01(math.log1p(max(0, candidate.review_count)) / math.log1p(2000))
+            scores.append(_clamp01(0.7 * stars_norm + 0.3 * reviews_norm))
+            continue
+
+        hints = SOFT_GT_CONSTRAINT_CATEGORY_HINTS.get(cons, set())
+        hit = 1.0 if cat_terms & hints else 0.0
+        scores.append(hit)
+
+    return _clamp01(sum(scores) / max(1, len(scores)))
+
+
+def _exposure_correction_score(review_count: int, max_review_count: int) -> float:
+    max_review = max(1, int(max_review_count))
+    pop = math.log1p(max(0, int(review_count))) / math.log1p(max_review)
+    # Higher means less exposed (long-tail friendly).
+    return _clamp01(1.0 - pop)
+
+
+def build_soft_ground_truth(
+    query_text: str,
+    query_family: str,
+    query_lat: float | None,
+    query_lon: float | None,
+    gt_business_id: str,
+    candidate_ids: list[str],
+    businesses: dict[str, BusinessLite],
+) -> dict[str, Any]:
+    gt_id = str(gt_business_id).strip()
+    anchor = businesses.get(gt_id)
+    if anchor is None:
+        return {
+            "version": "soft_gt_v1",
+            "family": query_family,
+            "constraint_signals": [],
+            "items": [{"business_id": gt_id, "relevance": 1.0}],
+        }
+
+    cfg = SOFT_GT_FAMILY_CONFIG.get(query_family, SOFT_GT_FAMILY_CONFIG["soft_constraint"])
+    weights = cfg["weights"]
+    query_constraints = _detect_query_constraints(query_text)
+
+    unique_candidate_ids: list[str] = []
+    seen: set[str] = set()
+    for bid in candidate_ids:
+        sid = str(bid).strip()
+        if not sid or sid in seen or sid not in businesses:
+            continue
+        unique_candidate_ids.append(sid)
+        seen.add(sid)
+    if gt_id not in seen:
+        unique_candidate_ids.append(gt_id)
+        seen.add(gt_id)
+
+    max_review_count = max(
+        [max(0, businesses[bid].review_count) for bid in unique_candidate_ids] or [1]
+    )
+
+    scored: list[tuple[str, float]] = []
+    for bid in unique_candidate_ids:
+        b = businesses[bid]
+        intent = _intent_consistency_score(query_text, b)
+        substitutability = _substitutability_score(anchor, b)
+        constraint = _constraint_match_score(
+            query_constraints=query_constraints,
+            candidate=b,
+            query_lat=query_lat,
+            query_lon=query_lon,
+        )
+        exposure = _exposure_correction_score(
+            review_count=b.review_count,
+            max_review_count=max_review_count,
+        )
+        raw = (
+            float(weights["intent"]) * intent
+            + float(weights["substitutability"]) * substitutability
+            + float(weights["constraint"]) * constraint
+            + float(weights["exposure"]) * exposure
+        )
+        if bid == gt_id:
+            raw += 0.08
+        scored.append((bid, raw))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    max_raw = max((s for _, s in scored), default=1.0)
+    min_rel = float(cfg["min_relevance"])
+    max_items = int(cfg["max_items"])
+
+    items: list[dict[str, Any]] = []
+    for bid, raw in scored:
+        rel = _clamp01(raw / max_raw) if max_raw > 1e-12 else 0.0
+        if bid == gt_id:
+            rel = 1.0
+        if rel >= min_rel or bid == gt_id:
+            items.append({"business_id": bid, "relevance": round(rel, 4)})
+        if len(items) >= max_items:
+            break
+
+    if not any(str(it.get("business_id", "")).strip() == gt_id for it in items):
+        items.insert(0, {"business_id": gt_id, "relevance": 1.0})
+
+    return {
+        "version": "soft_gt_v1",
+        "family": query_family,
+        "constraint_signals": query_constraints,
+        "items": items,
+    }
 
 
 class CloudLLMQueryGenerator:
@@ -605,6 +968,8 @@ def load_businesses(path: Path) -> dict[str, BusinessLite]:
             latitude=float(row.get("latitude", 0.0)),
             longitude=float(row.get("longitude", 0.0)),
             categories=parse_categories(row.get("categories")),
+            stars=float(row.get("stars", 0.0)),
+            review_count=int(row.get("review_count", 0)),
         )
     if not businesses:
         raise ValueError(f"No businesses loaded from: {path}")
@@ -737,6 +1102,59 @@ def make_candidate_set(
 
     rng.shuffle(picked)
     return picked[:target_size]
+
+
+def make_soft_gt_pool(
+    gt_business_id: str,
+    business: BusinessLite,
+    city_index: dict[str, list[str]],
+    category_index: dict[str, list[str]],
+    all_business_ids: list[str],
+    max_businesses: int,
+    rng: random.Random,
+) -> list[str]:
+    if max_businesses <= 0 or max_businesses >= len(all_business_ids):
+        return list(all_business_ids)
+
+    target = max(1, int(max_businesses))
+    picked: list[str] = [gt_business_id]
+    picked_set = {gt_business_id}
+
+    city_pool = [bid for bid in city_index.get(business.city.lower(), []) if bid not in picked_set]
+    rng.shuffle(city_pool)
+    city_take = int(target * 0.60)
+    for bid in city_pool:
+        if len(picked) >= city_take:
+            break
+        picked.append(bid)
+        picked_set.add(bid)
+
+    cat_pool: list[str] = []
+    for cat in business.categories:
+        for bid in category_index.get(cat.lower(), []):
+            if bid in picked_set:
+                continue
+            cat_pool.append(bid)
+    rng.shuffle(cat_pool)
+    cat_take = int(target * 0.85)
+    for bid in cat_pool:
+        if len(picked) >= cat_take:
+            break
+        if bid in picked_set:
+            continue
+        picked.append(bid)
+        picked_set.add(bid)
+
+    if len(picked) < target:
+        global_pool = [bid for bid in all_business_ids if bid not in picked_set]
+        rng.shuffle(global_pool)
+        for bid in global_pool:
+            if len(picked) >= target:
+                break
+            picked.append(bid)
+            picked_set.add(bid)
+
+    return picked[:target]
 
 
 def write_filtered_train_files(
@@ -961,6 +1379,37 @@ def main() -> None:
             family_counter[family_name] += 1
 
             query_id = f"{input_prefix}-{uid}-{event.source}-{event.line_no}"
+            candidate_ids = make_candidate_set(
+                gt_business_id=event.business_id,
+                business=b,
+                city_index=city_index,
+                category_index=category_index,
+                all_business_ids=all_business_ids,
+                candidate_size=args.candidate_size,
+                hard_negative_ratio=args.hard_negative_ratio,
+                rng=rng,
+            )
+            if args.soft_gt_scope == "full":
+                soft_gt_pool_ids = make_soft_gt_pool(
+                    gt_business_id=event.business_id,
+                    business=b,
+                    city_index=city_index,
+                    category_index=category_index,
+                    all_business_ids=all_business_ids,
+                    max_businesses=args.soft_gt_full_max_businesses,
+                    rng=rng,
+                )
+            else:
+                soft_gt_pool_ids = candidate_ids
+            soft_gt = build_soft_ground_truth(
+                query_text=query_text,
+                query_family=family_name,
+                query_lat=q_lat,
+                query_lon=q_lon,
+                gt_business_id=event.business_id,
+                candidate_ids=soft_gt_pool_ids,
+                businesses=businesses,
+            )
             query_row = {
                 "query_id": query_id,
                 "user_id": uid,
@@ -977,6 +1426,8 @@ def main() -> None:
                     "visit_time": event.date_text,
                     "source": event.source,
                 },
+                "ground_truth_soft": soft_gt,
+                "ground_truth_soft_scope": args.soft_gt_scope,
                 "perturbation": {
                     "time_back_minutes": back_minutes,
                     "distance_meters": round(move_meters, 3),
@@ -989,17 +1440,6 @@ def main() -> None:
                 },
             }
             fq.write(json.dumps(query_row, ensure_ascii=False) + "\n")
-
-            candidate_ids = make_candidate_set(
-                gt_business_id=event.business_id,
-                business=b,
-                city_index=city_index,
-                category_index=category_index,
-                all_business_ids=all_business_ids,
-                candidate_size=args.candidate_size,
-                hard_negative_ratio=args.hard_negative_ratio,
-                rng=rng,
-            )
             candidate_row = {
                 "query_id": query_id,
                 "user_id": uid,
@@ -1051,6 +1491,8 @@ def main() -> None:
         "query_family_target_distribution": dict(llm_generator.family_targets),
         "candidate_size": args.candidate_size,
         "hard_negative_ratio": args.hard_negative_ratio,
+        "soft_gt_scope": args.soft_gt_scope,
+        "soft_gt_full_max_businesses": args.soft_gt_full_max_businesses,
         "users_with_visits": len(users_with_visits),
         "held_out_events": len(selected_latest),
         "sampling": {
