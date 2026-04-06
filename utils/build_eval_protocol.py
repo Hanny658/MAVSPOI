@@ -90,6 +90,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-users",
+        type=int,
+        default=0,
+        help=(
+            "Deprecated alias for --sample-size. "
+            "Only used when --sample-size is 0."
+        ),
+    )
+    parser.add_argument(
         "--candidate-size",
         type=int,
         default=100,

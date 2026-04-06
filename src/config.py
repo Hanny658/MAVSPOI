@@ -22,6 +22,8 @@ class Settings:
     openai_api_key: str
     openai_model: str
     openai_embed_model: str
+    openai_base_url: str
+    openai_api_port: str
     yelp_business_json: str
     yelp_profile_json: str
     yelp_max_businesses: int
@@ -322,6 +324,24 @@ def load_settings() -> Settings:
         openai_embed_model=os.getenv(
             "OPENAI_EMBED_MODEL", "text-embedding-3-small"
         ).strip(),
+        openai_base_url=_as_str(
+            _pick(
+                yaml_cfg,
+                "openai_base_url",
+                "OPENAI_BASE_URL",
+                "",
+            ),
+            "",
+        ),
+        openai_api_port=_as_str(
+            _pick(
+                yaml_cfg,
+                "openai_api_port",
+                "OPENAI_API_PORT",
+                "",
+            ),
+            "",
+        ),
         yelp_business_json=yelp_business_json,
         yelp_profile_json=yelp_profile_json,
         yelp_max_businesses=yelp_max_businesses,

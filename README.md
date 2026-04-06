@@ -7,6 +7,7 @@
 This repo now contains:
 - A preserved **CoMaPOI-styled baseline** (`CoMaPOI_styled/*`).
 - A **Non-LLM Recall+Rerank baseline** (`Recall_Rerank/*`) using listwise CE reranking.
+- An **LLM4POI (API-LLM adapted) baseline** (`LLM4POI/*`) with trajectory prompting + key-query similarity.
 - A modular **MAVSPOI implementation in `src/`** with:
   - Hybrid Calibration Router
   - Chain-of-thought (internal) Voting Agents A1~A7
@@ -101,6 +102,8 @@ Settings are read from `config.yaml` (`runtime` + `mavspoi` sections), with opti
 
 Optional env var:
 - `CONFIG_YAML_PATH=...` to point to another YAML file.
+- `OPENAI_BASE_URL=...` to target an OpenAI-compatible API endpoint.
+- `OPENAI_API_PORT=...` optional port override for `OPENAI_BASE_URL` (or local default `http://127.0.0.1:<PORT>/v1` when base URL is empty).
 
 ## 5. Run
 
@@ -134,4 +137,5 @@ Fair-comparison assets remain unchanged:
 - Profile construction protocol
 - Metrics (`Hit@K`, `Recall@K`, `NDCG@K`, `MRR@K`)
 
-So results are directly comparable against `CoMaPOI_styled/*` and `SingleAgent/*` baselines.
+So results are directly comparable against baseline folders such as
+`CoMaPOI_styled/*`, `Recall_Rerank/*`, and `LLM4POI/*`.

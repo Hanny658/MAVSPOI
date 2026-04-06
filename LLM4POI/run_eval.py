@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate single-agent pipeline on processed eval queries/candidates."
+        description="Evaluate LLM4POI (API-LLM variant) on processed eval data."
     )
     parser.add_argument(
         "--eval-queries",
@@ -33,23 +33,25 @@ def parse_args() -> argparse.Namespace:
         default="constrained",
         help="Use candidate-constrained retrieval or full-corpus retrieval.",
     )
+    parser.add_argument("--max-queries", type=int, default=0, help="0 means all.")
+    parser.add_argument("--k-values", default="1,5,10", help="Comma-separated cutoffs.")
     parser.add_argument(
-        "--max-queries",
-        type=int,
-        default=0,
-        help="Maximum queries to evaluate. 0 means all.",
+        "--variant",
+        choices=["llm4poi", "llm4poi_star", "llm4poi_star2"],
+        default="llm4poi",
+        help="LLM4POI variants from paper: full, no-history, or user-history-only.",
     )
-    parser.add_argument(
-        "--k-values",
-        default="1,5,10",
-        help="Comma-separated cutoffs for ranking metrics.",
-    )
-    parser.add_argument(
-        "--cot-mode",
-        choices=["off", "embedded", "two_pass"],
-        default="off",
-        help="Optional CoT strategy for reranking.",
-    )
+    parser.add_argument("--trajectory-gap-hours", type=int, default=24)
+    parser.add_argument("--history-top-trajectories", type=int, default=20)
+    parser.add_argument("--max-history-records", type=int, default=300)
+    parser.add_argument("--max-current-records", type=int, default=50)
+    parser.add_argument("--max-similarity-pool", type=int, default=1200)
+    parser.add_argument("--max-query-trajectories", type=int, default=6000)
+    parser.add_argument("--rerank-pool-size", type=int, default=0)
+    parser.add_argument("--few-shot-examples", type=int, default=3)
+    parser.add_argument("--llm-stage1-temperature", type=float, default=0.0)
+    parser.add_argument("--llm-stage2-temperature", type=float, default=0.1)
+    parser.add_argument("--llm-retrieval-blend", type=float, default=0.25)
     parser.add_argument(
         "--save-predictions",
         default="",
@@ -81,9 +83,7 @@ def _load_candidate_map(path: Path) -> dict[str, list[str]]:
 def _parse_ks(raw: str) -> list[int]:
     parts = [x.strip() for x in raw.split(",") if x.strip()]
     ks = sorted({int(x) for x in parts if int(x) > 0})
-    if not ks:
-        return [1, 5, 10]
-    return ks
+    return ks or [1, 5, 10]
 
 
 def _dcg_from_rank(rank_1based: int) -> float:
@@ -103,28 +103,6 @@ def _metric_at_k(ranked_ids: list[str], gt_id: str, k: int) -> dict[str, float]:
         "ndcg": _dcg_from_rank(rank),
         "mrr": 1.0 / rank,
     }
-
-
-def _to_context(row: dict[str, Any]) -> UserQueryContext:
-    from src.schemas import GeoPoint, UserQueryContext
-
-    loc = row.get("query_location") or {}
-    lat = loc.get("lat")
-    lon = loc.get("lon")
-    geo = None
-    if lat is not None and lon is not None:
-        geo = GeoPoint(lat=float(lat), lon=float(lon))
-    slice_info = row.get("evaluation_slice") or {}
-    return UserQueryContext(
-        query_text=str(row.get("query_text", "")).strip(),
-        local_time=str(row.get("query_local_time", "")).strip(),
-        location=geo,
-        city=str(slice_info.get("city", "")).strip(),
-        state=str(slice_info.get("state", "")).strip(),
-        user_id=str(row.get("user_id", "anonymous")).strip() or "anonymous",
-        long_term_notes="",
-        recent_activity_notes="",
-    )
 
 
 def _agg_init(ks: list[int]) -> dict[str, Any]:
@@ -159,6 +137,28 @@ def _agg_finalize(agg: dict[str, Any]) -> dict[str, Any]:
             "mrr": round(bucket["mrr"] / count, 6),
         }
     return out
+
+
+def _to_context(row: dict[str, Any]):
+    from src.schemas import GeoPoint, UserQueryContext
+
+    loc = row.get("query_location") or {}
+    lat = loc.get("lat")
+    lon = loc.get("lon")
+    geo = None
+    if lat is not None and lon is not None:
+        geo = GeoPoint(lat=float(lat), lon=float(lon))
+    slice_info = row.get("evaluation_slice") or {}
+    return UserQueryContext(
+        query_text=str(row.get("query_text", "")).strip(),
+        local_time=str(row.get("query_local_time", "")).strip(),
+        location=geo,
+        city=str(slice_info.get("city", "")).strip(),
+        state=str(slice_info.get("state", "")).strip(),
+        user_id=str(row.get("user_id", "anonymous")).strip() or "anonymous",
+        long_term_notes="",
+        recent_activity_notes="",
+    )
 
 
 def _estimate_eval_total(path: Path, max_queries: int) -> int:
@@ -196,7 +196,7 @@ def _stream_progress(processed: int, total: int, start_ts: float) -> None:
 
 def main() -> None:
     args = parse_args()
-    from SingleAgent.pipeline import SingleAgentRealtimeRecommender
+    from LLM4POI.pipeline import LLM4POIRealtimeRecommender
     from src.config import load_settings
 
     eval_queries_path = Path(args.eval_queries)
@@ -208,7 +208,21 @@ def main() -> None:
 
     ks = _parse_ks(args.k_values)
     settings = load_settings()
-    recommender = SingleAgentRealtimeRecommender(settings, cot_mode=args.cot_mode)
+    recommender = LLM4POIRealtimeRecommender(
+        settings=settings,
+        variant=args.variant,
+        trajectory_gap_hours=args.trajectory_gap_hours,
+        history_top_trajectories=args.history_top_trajectories,
+        max_history_records=args.max_history_records,
+        max_current_records=args.max_current_records,
+        max_similarity_pool=args.max_similarity_pool,
+        max_query_trajectories=args.max_query_trajectories,
+        rerank_pool_size=(args.rerank_pool_size if args.rerank_pool_size > 0 else None),
+        few_shot_examples=args.few_shot_examples,
+        llm_stage1_temperature=args.llm_stage1_temperature,
+        llm_stage2_temperature=args.llm_stage2_temperature,
+        llm_retrieval_blend=args.llm_retrieval_blend,
+    )
     candidate_map = (
         _load_candidate_map(eval_candidates_path) if args.mode == "constrained" else {}
     )
@@ -236,10 +250,9 @@ def main() -> None:
 
         context = _to_context(row)
         if args.mode == "constrained":
-            candidate_ids = candidate_map.get(query_id, [])
             result = recommender.recommend_with_candidates(
                 context=context,
-                candidate_business_ids=candidate_ids,
+                candidate_business_ids=candidate_map.get(query_id, []),
                 top_k=max(ks),
             )
         else:
@@ -265,7 +278,7 @@ def main() -> None:
                         "gt_business_id": gt_id,
                         "ranked_business_ids": ranked_ids,
                         "mode": args.mode,
-                        "cot_mode": args.cot_mode,
+                        "variant": args.variant,
                     },
                     ensure_ascii=False,
                 )
@@ -280,13 +293,12 @@ def main() -> None:
 
     if total > 0:
         print("", file=sys.stderr, flush=True)
-
     if pred_writer:
         pred_writer.close()
 
     summary = {
         "mode": args.mode,
-        "cot_mode": args.cot_mode,
+        "variant": args.variant,
         "eval_queries": str(eval_queries_path),
         "eval_candidates": str(eval_candidates_path) if args.mode == "constrained" else "",
         "processed_queries": processed,
