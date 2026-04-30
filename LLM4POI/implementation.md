@@ -36,6 +36,8 @@ To better approximate the original fine-tuned behavior, the runtime applies:
   - Stage-1: predict single next POI id (QA-style).
   - Stage-2: rerank candidate POIs with stage-1 as prior.
 - Light post-hoc calibration blending stage-2 confidence with retrieval prior.
+- Candidate aliasing (`0..N-1`) inside prompts to reduce long-ID generation errors.
+- Auto-fill to `top_k` using retrieval prior when LLM returns short lists.
 
 ## Runtime files
 

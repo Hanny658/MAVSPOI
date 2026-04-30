@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -585,6 +586,39 @@ class LLM4POIRealtimeRecommender:
             rows = rows[:-1]
         return " ".join(rows)
 
+    def _build_alias_maps(
+        self,
+        candidates: list[CandidateScore],
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        alias_to_id: dict[str, str] = {}
+        id_to_alias: dict[str, str] = {}
+        for idx, c in enumerate(candidates):
+            alias = str(idx)
+            bid = c.business.business_id
+            alias_to_id[alias] = bid
+            id_to_alias[bid] = alias
+        return alias_to_id, id_to_alias
+
+    def _resolve_candidate_token(
+        self,
+        token: Any,
+        alias_to_id: dict[str, str],
+        allowed_ids: set[str],
+    ) -> str:
+        text = str(token or "").strip()
+        if not text:
+            return ""
+        if text in alias_to_id:
+            return alias_to_id[text]
+        if text in allowed_ids:
+            return text
+        match = re.search(r"\d+", text)
+        if match:
+            alias = match.group(0)
+            if alias in alias_to_id:
+                return alias_to_id[alias]
+        return ""
+
     def _build_few_shot_examples(
         self,
         history_trajectories: list[Trajectory],
@@ -617,6 +651,7 @@ class LLM4POIRealtimeRecommender:
         current_events: list[CheckinEvent],
         history_trajectories: list[Trajectory],
         candidates: list[CandidateScore],
+        alias_to_id: dict[str, str],
     ) -> tuple[str, str]:
         current_text = self._events_to_block_text(current_events, drop_last=True)
         if not current_text:
@@ -631,13 +666,27 @@ class LLM4POIRealtimeRecommender:
         if not history_text:
             history_text = "No additional historical trajectories are available."
 
-        candidate_ids = [c.business.business_id for c in candidates]
+        id_to_alias = {bid: alias for alias, bid in alias_to_id.items()}
+        candidate_rows: list[dict[str, Any]] = []
+        for c in candidates:
+            bid = c.business.business_id
+            candidate_rows.append(
+                {
+                    "alias": str(id_to_alias.get(bid, "")),
+                    "business_id": bid,
+                    "name": c.business.name,
+                    "category": c.business.categories[0] if c.business.categories else "unknown",
+                    "city": c.business.city,
+                    "state": c.business.state,
+                }
+            )
+        candidate_aliases = list(alias_to_id.keys())
         few_shot = self._build_few_shot_examples(history_trajectories)
         question = (
             f"<question> The following is a trajectory of user {context.user_id}: {current_text} "
             f"There is also historical data: {history_text} "
             f"Given the data, at {context.local_time}, which POI id will user {context.user_id} visit next? "
-            f"POI ids must be one of: {candidate_ids}."
+            f"Use alias tokens only, one of: {candidate_aliases}."
         )
         payload = {
             "few_shot_examples": few_shot,
@@ -645,25 +694,26 @@ class LLM4POIRealtimeRecommender:
             "query_text": context.query_text,
             "query_city": context.city,
             "query_state": context.state,
-            "candidate_ids": candidate_ids,
+            "candidate_aliases": candidate_aliases,
+            "candidate_lookup": candidate_rows,
             "long_term_notes": context.long_term_notes,
             "recent_activity_notes": context.recent_activity_notes,
         }
         system_prompt = (
             "You are LLM4POI stage-1 predictor.\n"
-            "Task: mimic next-POI QA behavior and output a single next POI id.\n"
+            "Task: mimic next-POI QA behavior and output a single next POI alias.\n"
             "Think internally using trajectory patterns and history similarity, but output JSON only.\n"
             "JSON schema:\n"
             "{\n"
-            '  "next_poi_id": "string",\n'
+            '  "next_poi_alias": "string",\n'
             '  "confidence": 0,\n'
             '  "reasoning_tags": ["string"],\n'
             '  "qa_style_answer": "string"\n'
             "}\n"
             "Rules:\n"
-            "- next_poi_id must be in candidate_ids.\n"
+            "- next_poi_alias must be one of candidate_aliases.\n"
             "- confidence in [0,1].\n"
-            "- qa_style_answer follows: At [time], user [id] will visit POI id [poi_id]."
+            "- qa_style_answer follows: At [time], user [id] will visit POI alias [alias]."
         )
         user_prompt = "Input JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
         return system_prompt, user_prompt
@@ -674,6 +724,8 @@ class LLM4POIRealtimeRecommender:
         current_events: list[CheckinEvent],
         history_trajectories: list[Trajectory],
         candidates: list[CandidateScore],
+        alias_to_id: dict[str, str],
+        id_to_alias: dict[str, str],
         top_k: int,
         stage1_draft: dict[str, Any],
     ) -> tuple[str, str]:
@@ -699,6 +751,7 @@ class LLM4POIRealtimeRecommender:
             category = c.business.categories[0] if c.business.categories else "unknown"
             candidate_rows.append(
                 {
+                    "alias": str(id_to_alias.get(c.business.business_id, "")),
                     "business_id": c.business.business_id,
                     "name": c.business.name,
                     "category": category,
@@ -709,7 +762,9 @@ class LLM4POIRealtimeRecommender:
                 }
             )
 
-        draft_id = str(stage1_draft.get("next_poi_id", "")).strip()
+        draft_alias_raw = stage1_draft.get("next_poi_alias", stage1_draft.get("next_poi_id", ""))
+        draft_alias = str(draft_alias_raw).strip()
+        draft_id = alias_to_id.get(draft_alias, "")
         draft_conf = _clip01(_safe_float(stage1_draft.get("confidence", 0.0), 0.0))
         draft_tags = stage1_draft.get("reasoning_tags", [])
         if not isinstance(draft_tags, list):
@@ -729,8 +784,10 @@ class LLM4POIRealtimeRecommender:
             "query_state": context.state,
             "long_term_notes": context.long_term_notes,
             "recent_activity_notes": context.recent_activity_notes,
+            "candidate_aliases": list(alias_to_id.keys()),
             "stage1_draft": {
-                "next_poi_id": draft_id,
+                "next_poi_alias": draft_alias,
+                "next_poi_id_resolved": draft_id,
                 "confidence": draft_conf,
                 "reasoning_tags": draft_tags[:6],
             },
@@ -746,7 +803,7 @@ class LLM4POIRealtimeRecommender:
             "{\n"
             '  "recommendations": [\n'
             "    {\n"
-            '      "business_id": "string",\n'
+            '      "poi_alias": "string",\n'
             '      "score": 0,\n'
             '      "reason": "string",\n'
             '      "fit_tags": ["string"]\n'
@@ -755,11 +812,11 @@ class LLM4POIRealtimeRecommender:
             '  "final_summary": "string"\n'
             "}\n"
             "Rules:\n"
-            "- Choose business_id only from candidate_pois.\n"
+            "- Output poi_alias only, using candidate_aliases.\n"
             "- Prioritize immediate next-visit plausibility (top1 first), then fill top-k.\n"
             "- Use stage1_draft as prior, not as hard constraint.\n"
             "- Higher score means higher confidence; score in [0,1].\n"
-            "- Do not output duplicate business_id."
+            "- Do not output duplicate poi_alias."
         )
         user_prompt = "Input JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
         return system_prompt, user_prompt
@@ -768,6 +825,7 @@ class LLM4POIRealtimeRecommender:
         self,
         raw_rows: Any,
         candidates: list[CandidateScore],
+        alias_to_id: dict[str, str],
         top_k: int,
     ) -> list[dict[str, Any]]:
         allowed = {c.business.business_id for c in candidates}
@@ -779,7 +837,13 @@ class LLM4POIRealtimeRecommender:
         for row in raw_rows:
             if not isinstance(row, dict):
                 continue
-            business_id = str(row.get("business_id", "")).strip()
+            raw_token = (
+                row.get("poi_alias", "")
+                or row.get("business_id", "")
+                or row.get("candidate_alias", "")
+                or row.get("poi_id", "")
+            )
+            business_id = self._resolve_candidate_token(raw_token, alias_to_id, allowed)
             if business_id not in allowed or business_id in seen:
                 continue
             score = _clip01(_safe_float(row.get("score", 0.5), 0.5))
@@ -830,6 +894,43 @@ class LLM4POIRealtimeRecommender:
                 }
             )
         return out
+
+    def _fill_to_top_k(
+        self,
+        rows: list[dict[str, Any]],
+        candidates: list[CandidateScore],
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        if len(rows) >= top_k:
+            return rows[:top_k]
+        seen = {
+            str(row.get("business", {}).get("business_id", "")).strip()
+            for row in rows
+            if isinstance(row, dict)
+        }
+        for c in candidates:
+            bid = c.business.business_id
+            if bid in seen:
+                continue
+            rows.append(
+                {
+                    "business": c.business.to_compact_dict(),
+                    "ranking_score": _clip01(c.score),
+                    "reason": "Filled by retrieval prior due to short LLM list.",
+                    "fit_tags": ["retrieval_fill"],
+                    "retrieval_components": {
+                        "retrieval_score": c.score,
+                        "text_similarity": c.text_similarity,
+                        "geo_score": c.geo_score,
+                        "popularity_score": c.popularity_score,
+                        "distance_km": c.distance_km,
+                    },
+                }
+            )
+            seen.add(bid)
+            if len(rows) >= top_k:
+                break
+        return rows[:top_k]
 
     def _retrieval_norm_map(self, candidates: list[CandidateScore]) -> dict[str, float]:
         if not candidates:
@@ -909,6 +1010,8 @@ class LLM4POIRealtimeRecommender:
             retrieval_mode = "full_corpus"
 
         candidate_pool = initial_candidates[:rerank_pool_k]
+        alias_to_id, id_to_alias = self._build_alias_maps(candidate_pool)
+        allowed_ids = {c.business.business_id for c in candidate_pool}
         current_events, query_time = self._select_current_events(enriched_context)
         history_trajectories, history_meta = self._select_history_trajectories(
             context=enriched_context,
@@ -923,6 +1026,7 @@ class LLM4POIRealtimeRecommender:
             current_events=current_events,
             history_trajectories=history_trajectories,
             candidates=candidate_pool,
+            alias_to_id=alias_to_id,
         )
         try:
             stage1_result = self.openai_service.chat_json(
@@ -934,8 +1038,9 @@ class LLM4POIRealtimeRecommender:
         except Exception as exc:
             stage1_error = f"{type(exc).__name__}: {exc}"
 
-        stage1_draft_id = str(stage1_result.get("next_poi_id", "")).strip()
-        if stage1_draft_id and stage1_draft_id not in {c.business.business_id for c in candidate_pool}:
+        stage1_token = stage1_result.get("next_poi_alias", stage1_result.get("next_poi_id", ""))
+        stage1_draft_id = self._resolve_candidate_token(stage1_token, alias_to_id, allowed_ids)
+        if stage1_draft_id and stage1_draft_id not in allowed_ids:
             stage1_draft_id = ""
 
         system_prompt, user_prompt = self._build_prompt_blocks(
@@ -943,6 +1048,8 @@ class LLM4POIRealtimeRecommender:
             current_events=current_events,
             history_trajectories=history_trajectories,
             candidates=candidate_pool,
+            alias_to_id=alias_to_id,
+            id_to_alias=id_to_alias,
             top_k=top_k,
             stage1_draft=stage1_result,
         )
@@ -962,10 +1069,13 @@ class LLM4POIRealtimeRecommender:
         recommendations = self._sanitize_recommendations(
             raw_rows=llm_result.get("recommendations", []),
             candidates=candidate_pool,
+            alias_to_id=alias_to_id,
             top_k=top_k,
         )
         if not recommendations:
             recommendations = self._fallback_recommendations(candidate_pool, top_k)
+        else:
+            recommendations = self._fill_to_top_k(recommendations, candidate_pool, top_k)
         recommendations = self._prompt_engineering_calibration(
             rows=recommendations,
             candidates=candidate_pool,
